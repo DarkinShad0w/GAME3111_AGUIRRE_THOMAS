@@ -1110,6 +1110,7 @@ void ShapesApp::BuildRenderItems()
 	mAllRitems.push_back(std::move(keepPyramidRoofRitem));
 
 	// KEEP SIDE TOWERS
+	// SW
 	auto keepFrontLeftTowerRitem = std::make_unique<RenderItem>();
 	XMMATRIX frontLeftTowerScale = XMMatrixScaling(0.7f, 1.0f, 0.7f) * XMMatrixTranslation(-6.5f, 2.0f, -5.0f);
 	XMStoreFloat4x4(&keepFrontLeftTowerRitem->World, frontLeftTowerScale);
@@ -1121,6 +1122,7 @@ void ShapesApp::BuildRenderItems()
 	keepFrontLeftTowerRitem->BaseVertexLocation = keepFrontLeftTowerRitem->Geo->DrawArgs["hexTower"].BaseVertexLocation;
 	mAllRitems.push_back(std::move(keepFrontLeftTowerRitem));
 
+	// SE
 	auto keepFrontRightTowerRitem = std::make_unique<RenderItem>();
 	XMMATRIX frontRightTowerScale = XMMatrixScaling(0.7f, 1.0f, 0.7f) * XMMatrixTranslation(6.5f, 2.0f, -5.0f);
 	XMStoreFloat4x4(&keepFrontRightTowerRitem->World, frontRightTowerScale);
@@ -1132,6 +1134,7 @@ void ShapesApp::BuildRenderItems()
 	keepFrontRightTowerRitem->BaseVertexLocation = keepFrontRightTowerRitem->Geo->DrawArgs["hexTower"].BaseVertexLocation;
 	mAllRitems.push_back(std::move(keepFrontRightTowerRitem));
 
+	// NW
 	auto keepBackLeftTowerRitem = std::make_unique<RenderItem>();
 	XMMATRIX backLeftTowerScale = XMMatrixScaling(0.7f, 1.0f, 0.7f) * XMMatrixTranslation(-6.5f, 2.0f, 5.0f);
 	XMStoreFloat4x4(&keepBackLeftTowerRitem->World, backLeftTowerScale);
@@ -1143,6 +1146,7 @@ void ShapesApp::BuildRenderItems()
 	keepBackLeftTowerRitem->BaseVertexLocation = keepBackLeftTowerRitem->Geo->DrawArgs["hexTower"].BaseVertexLocation;
 	mAllRitems.push_back(std::move(keepBackLeftTowerRitem));
 
+	// NE
 	auto keepBackRightTowerRitem = std::make_unique<RenderItem>();
 	XMMATRIX backRightTowerScale = XMMatrixScaling(0.7f, 1.0f, 0.7f) * XMMatrixTranslation(6.5f, 2.0f, 5.0f);
 	XMStoreFloat4x4(&keepBackRightTowerRitem->World, backRightTowerScale);
@@ -1155,6 +1159,7 @@ void ShapesApp::BuildRenderItems()
 	mAllRitems.push_back(std::move(keepBackRightTowerRitem));
 
 	// KEEP SIDE TOWER CONE ROOFS
+	// SW
 	auto keepFrontLeftConeRoofRitem = std::make_unique<RenderItem>();
 	XMMATRIX frontLeftConeTransform = XMMatrixScaling(0.8f, 1.7f, 0.7f) * XMMatrixTranslation(-6.5f, 16.0f, -5.0f);
 	XMStoreFloat4x4(&keepFrontLeftConeRoofRitem->World, frontLeftConeTransform);
@@ -1166,6 +1171,7 @@ void ShapesApp::BuildRenderItems()
 	keepFrontLeftConeRoofRitem->BaseVertexLocation = keepFrontLeftConeRoofRitem->Geo->DrawArgs["keepConeRoof"].BaseVertexLocation;
 	mAllRitems.push_back(std::move(keepFrontLeftConeRoofRitem));
 
+	// SE
 	auto keepFrontRightConeRoofRitem = std::make_unique<RenderItem>();
 	XMMATRIX frontRightConeTransform = XMMatrixScaling(0.8f, 1.7f, 0.7f) * XMMatrixTranslation(6.5f, 16.0f, -5.0f);
 	XMStoreFloat4x4(&keepFrontRightConeRoofRitem->World, frontRightConeTransform);
@@ -1177,6 +1183,7 @@ void ShapesApp::BuildRenderItems()
 	keepFrontRightConeRoofRitem->BaseVertexLocation = keepFrontRightConeRoofRitem->Geo->DrawArgs["keepConeRoof"].BaseVertexLocation;
 	mAllRitems.push_back(std::move(keepFrontRightConeRoofRitem));
 
+	// NW
 	auto keepBackLeftConeRoofRitem = std::make_unique<RenderItem>();
 	XMMATRIX backLeftConeTransform = XMMatrixScaling(0.8f, 1.7f, 0.7f) * XMMatrixTranslation(-6.5f, 16.0f, 5.0f);
 	XMStoreFloat4x4(&keepBackLeftConeRoofRitem->World, backLeftConeTransform);
@@ -1188,6 +1195,7 @@ void ShapesApp::BuildRenderItems()
 	keepBackLeftConeRoofRitem->BaseVertexLocation = keepBackLeftConeRoofRitem->Geo->DrawArgs["keepConeRoof"].BaseVertexLocation;
 	mAllRitems.push_back(std::move(keepBackLeftConeRoofRitem));
 
+	// NE
 	auto keepBackRightConeRoofRitem = std::make_unique<RenderItem>();
 	XMMATRIX backRightConeTransform = XMMatrixScaling(0.8f, 1.7f, 0.7f) * XMMatrixTranslation(6.5f, 16.0f, 5.0f);
 	XMStoreFloat4x4(&keepBackRightConeRoofRitem->World, backRightConeTransform);
