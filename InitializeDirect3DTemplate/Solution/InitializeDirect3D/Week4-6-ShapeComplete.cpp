@@ -1,24 +1,9 @@
-/** @file Week4-6-ShapeComplete.cpp
- *  @brief Shape Practice Solution.
- *
- *  Place all of the scene geometry in one big vertex and index buffer.
- * Then use the DrawIndexedInstanced method to draw one object at a time ((as the
- * world matrix needs to be changed between objects)
- *
- *   Controls:
- *   Hold down '1' key to view scene in wireframe mode.
- *   Hold the left mouse button down and move the mouse to rotate.
- *   Hold the right mouse button down and move the mouse to zoom in and out.
- *
- *  @author Hooman Salamat
- */
-
-
 #include "../../Common/d3dApp.h"
 #include "../../Common/MathHelper.h"
 #include "../../Common/UploadBuffer.h"
 #include "../../Common/GeometryGenerator.h"
 #include "FrameResource.h"
+#include "Waves.h"
 
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
@@ -26,35 +11,34 @@ using namespace DirectX::PackedVector;
 
 const int gNumFrameResources = 3;
 
-// Lightweight structure stores parameters to draw a shape.  This will winMain
-// vary from app-to-app.
 struct RenderItem
 {
 	RenderItem() = default;
+	RenderItem(const RenderItem& rhs) = delete;
 
-	// World matrix of the shape that describes the object's local space
-	// relative to the world space, which defines the position, orientation,
-	// and scale of the object in the world.
 	XMFLOAT4X4 World = MathHelper::Identity4x4();
+	XMFLOAT4X4 TexTransform = MathHelper::Identity4x4();
 
-	// Dirty flag indicating the object data has changed and we need to update the constant buffer.
-	// Because we have an object cbuffer for each FrameResource, we have to apply the
-	// update to each FrameResource.  Thus, when we modify obect data we should set 
-	// NumFramesDirty = gNumFrameResources so that each frame resource gets the update.
 	int NumFramesDirty = gNumFrameResources;
 
-	// Index into GPU constant buffer corresponding to the ObjectCB for this render item.
 	UINT ObjCBIndex = -1;
 
+	Material* Mat = nullptr;
 	MeshGeometry* Geo = nullptr;
 
-	// Primitive topology.
 	D3D12_PRIMITIVE_TOPOLOGY PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 
-	// DrawIndexedInstanced parameters.
 	UINT IndexCount = 0;
 	UINT StartIndexLocation = 0;
 	int BaseVertexLocation = 0;
+};
+
+enum class RenderLayer : int
+{
+	Opaque = 0,
+	Transparent,
+	AlphaTestedTreeSprites,
+	Count
 };
 
 class ShapesApp : public D3DApp
@@ -79,17 +63,23 @@ private:
 	void OnKeyboardInput(const GameTimer& gt);
 	void UpdateCamera(const GameTimer& gt);
 	void UpdateObjectCBs(const GameTimer& gt);
+	void UpdateMaterialCBs(const GameTimer& gt);
 	void UpdateMainPassCB(const GameTimer& gt);
 
+	void LoadTextures();
 	void BuildDescriptorHeaps();
-	void BuildConstantBufferViews();
 	void BuildRootSignature();
 	void BuildShadersAndInputLayout();
 	void BuildShapeGeometry();
+	void BuildWaterGeometry();
+	void BuildTreeSpritesGeometry();
 	void BuildPSOs();
 	void BuildFrameResources();
+	void BuildMaterials();
 	void BuildRenderItems();
 	void DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vector<RenderItem*>& ritems);
+
+	std::array<const CD3DX12_STATIC_SAMPLER_DESC, 6> GetStaticSamplers();
 
 private:
 
@@ -97,22 +87,24 @@ private:
 	FrameResource* mCurrFrameResource = nullptr;
 	int mCurrFrameResourceIndex = 0;
 
-	ComPtr<ID3D12RootSignature> mRootSignature = nullptr;
-	ComPtr<ID3D12DescriptorHeap> mCbvHeap = nullptr;
+	UINT mCbvSrvDescriptorSize = 0;
 
+	ComPtr<ID3D12RootSignature> mRootSignature = nullptr;
 	ComPtr<ID3D12DescriptorHeap> mSrvDescriptorHeap = nullptr;
 
 	std::unordered_map<std::string, std::unique_ptr<MeshGeometry>> mGeometries;
+	std::unordered_map<std::string, std::unique_ptr<Material>> mMaterials;
+	std::unordered_map<std::string, std::unique_ptr<Texture>> mTextures;
 	std::unordered_map<std::string, ComPtr<ID3DBlob>> mShaders;
 	std::unordered_map<std::string, ComPtr<ID3D12PipelineState>> mPSOs;
 
 	std::vector<D3D12_INPUT_ELEMENT_DESC> mInputLayout;
+	std::vector<D3D12_INPUT_ELEMENT_DESC> mTreeSpriteInputLayout;
 
-	// List of all the render items.
 	std::vector<std::unique_ptr<RenderItem>> mAllRitems;
 
-	// Render items divided by PSO.
-	std::vector<RenderItem*> mOpaqueRitems;
+	std::vector<RenderItem*> mRitemLayer[(int)RenderLayer::Count];
+	RenderItem* mWaterRitem = nullptr;
 
 	PassConstants mMainPassCB;
 
@@ -172,14 +164,18 @@ bool ShapesApp::Initialize()
 
 	// Reset the command list to prep for initialization commands.
 	ThrowIfFailed(mCommandList->Reset(mDirectCmdListAlloc.Get(), nullptr));
+	mCbvSrvDescriptorSize = md3dDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
+	LoadTextures();
 	BuildRootSignature();
+	BuildDescriptorHeaps();
 	BuildShadersAndInputLayout();
 	BuildShapeGeometry();
+	BuildWaterGeometry();
+	BuildTreeSpritesGeometry();
+	BuildMaterials();
 	BuildRenderItems();
 	BuildFrameResources();
-	BuildDescriptorHeaps();
-	BuildConstantBufferViews();
 	BuildPSOs();
 
 	// Execute the initialization commands.
@@ -222,6 +218,7 @@ void ShapesApp::Update(const GameTimer& gt)
 	}
 
 	UpdateObjectCBs(gt);
+	UpdateMaterialCBs(gt);
 	UpdateMainPassCB(gt);
 }
 
@@ -258,17 +255,26 @@ void ShapesApp::Draw(const GameTimer& gt)
 	// Specify the buffers we are going to render to.
 	mCommandList->OMSetRenderTargets(1, &CurrentBackBufferView(), true, &DepthStencilView());
 
-	ID3D12DescriptorHeap* descriptorHeaps[] = { mCbvHeap.Get() };
+	ID3D12DescriptorHeap* descriptorHeaps[] = { mSrvDescriptorHeap.Get() };
 	mCommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
 
 	mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
 
-	int passCbvIndex = mPassCbvOffset + mCurrFrameResourceIndex;
-	auto passCbvHandle = CD3DX12_GPU_DESCRIPTOR_HANDLE(mCbvHeap->GetGPUDescriptorHandleForHeapStart());
-	passCbvHandle.Offset(passCbvIndex, mCbvSrvUavDescriptorSize);
-	mCommandList->SetGraphicsRootDescriptorTable(1, passCbvHandle);
+	auto passCB = mCurrFrameResource->PassCB->Resource();
+	mCommandList->SetGraphicsRootConstantBufferView(2, passCB->GetGPUVirtualAddress());
 
-	DrawRenderItems(mCommandList.Get(), mOpaqueRitems);
+	// ========== DRAW IN CORRECT ORDER ==========
+	// 1. Draw OPAQUE objects first (castle, ground, walls, towers, etc.)
+	DrawRenderItems(mCommandList.Get(), mRitemLayer[(int)RenderLayer::Opaque]);
+
+	// 2. Draw TREES (alpha tested - discards transparent pixels, renders over opaque)
+	mCommandList->SetPipelineState(mPSOs["treeSprites"].Get());
+	DrawRenderItems(mCommandList.Get(), mRitemLayer[(int)RenderLayer::AlphaTestedTreeSprites]);
+
+	// 3. Draw TRANSPARENT objects last (water - blends with everything behind it)
+	mCommandList->SetPipelineState(mPSOs["transparent"].Get());
+	DrawRenderItems(mCommandList.Get(), mRitemLayer[(int)RenderLayer::Transparent]);
+	// ========== END DRAW ORDER ==========
 
 	// Indicate a state transition on the resource usage.
 	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(),
@@ -368,19 +374,41 @@ void ShapesApp::UpdateObjectCBs(const GameTimer& gt)
 	auto currObjectCB = mCurrFrameResource->ObjectCB.get();
 	for (auto& e : mAllRitems)
 	{
-		// Only update the cbuffer data if the constants have changed.  
-		// This needs to be tracked per frame resource.
 		if (e->NumFramesDirty > 0)
 		{
 			XMMATRIX world = XMLoadFloat4x4(&e->World);
+			XMMATRIX texTransform = XMLoadFloat4x4(&e->TexTransform);
 
 			ObjectConstants objConstants;
 			XMStoreFloat4x4(&objConstants.World, XMMatrixTranspose(world));
+			XMStoreFloat4x4(&objConstants.TexTransform, XMMatrixTranspose(texTransform));
 
 			currObjectCB->CopyData(e->ObjCBIndex, objConstants);
 
-			// Next FrameResource need to be updated too.
 			e->NumFramesDirty--;
+		}
+	}
+}
+
+void ShapesApp::UpdateMaterialCBs(const GameTimer& gt)
+{
+	auto currMaterialCB = mCurrFrameResource->MaterialCB.get();
+	for (auto& e : mMaterials)
+	{
+		Material* mat = e.second.get();
+		if (mat->NumFramesDirty > 0)
+		{
+			XMMATRIX matTransform = XMLoadFloat4x4(&mat->MatTransform);
+
+			MaterialConstants matConstants;
+			matConstants.DiffuseAlbedo = mat->DiffuseAlbedo;
+			matConstants.FresnelR0 = mat->FresnelR0;
+			matConstants.Roughness = mat->Roughness;
+			XMStoreFloat4x4(&matConstants.MatTransform, XMMatrixTranspose(matTransform));
+
+			currMaterialCB->CopyData(mat->MatCBIndex, matConstants);
+
+			mat->NumFramesDirty--;
 		}
 	}
 }
@@ -408,99 +436,170 @@ void ShapesApp::UpdateMainPassCB(const GameTimer& gt)
 	mMainPassCB.FarZ = 1000.0f;
 	mMainPassCB.TotalTime = gt.TotalTime();
 	mMainPassCB.DeltaTime = gt.DeltaTime();
+	mMainPassCB.AmbientLight = { 0.25f, 0.25f, 0.35f, 1.0f };
+
+	// Directional Lights (3 lights)
+	mMainPassCB.Lights[0].Direction = { 0.57735f, -0.57735f, 0.57735f };
+	mMainPassCB.Lights[0].Strength = { 0.8f, 0.8f, 0.8f };
+	mMainPassCB.Lights[1].Direction = { -0.57735f, -0.57735f, 0.57735f };
+	mMainPassCB.Lights[1].Strength = { 0.4f, 0.4f, 0.4f };
+	mMainPassCB.Lights[2].Direction = { 0.0f, -0.707f, -0.707f };
+	mMainPassCB.Lights[2].Strength = { 0.2f, 0.2f, 0.2f };
+
+	// Point Lights - 4 red lights at each corner tower
+	// Northwest Tower
+	mMainPassCB.Lights[3].Position = { -30.0f, 5.0f, 30.0f };
+	mMainPassCB.Lights[3].Strength = { 1.0f, 0.2f, 0.2f };
+	mMainPassCB.Lights[3].FalloffStart = 5.0f;
+	mMainPassCB.Lights[3].FalloffEnd = 25.0f;
+
+	// Northeast Tower
+	mMainPassCB.Lights[4].Position = { 30.0f, 5.0f, 30.0f };
+	mMainPassCB.Lights[4].Strength = { 1.0f, 0.2f, 0.2f };
+	mMainPassCB.Lights[4].FalloffStart = 5.0f;
+	mMainPassCB.Lights[4].FalloffEnd = 25.0f;
+
+	// Southwest Tower
+	mMainPassCB.Lights[5].Position = { -30.0f, 5.0f, -30.0f };
+	mMainPassCB.Lights[5].Strength = { 1.0f, 0.2f, 0.2f };
+	mMainPassCB.Lights[5].FalloffStart = 5.0f;
+	mMainPassCB.Lights[5].FalloffEnd = 25.0f;
+
+	// Southeast Tower
+	mMainPassCB.Lights[6].Position = { 30.0f, 5.0f, -30.0f };
+	mMainPassCB.Lights[6].Strength = { 1.0f, 0.2f, 0.2f };
+	mMainPassCB.Lights[6].FalloffStart = 5.0f;
+	mMainPassCB.Lights[6].FalloffEnd = 25.0f;
 
 	auto currPassCB = mCurrFrameResource->PassCB.get();
 	currPassCB->CopyData(0, mMainPassCB);
 }
 
-void ShapesApp::BuildDescriptorHeaps()
+void ShapesApp::LoadTextures()
 {
-	UINT objCount = (UINT)mOpaqueRitems.size();
+	auto stoneTex = std::make_unique<Texture>();
+	stoneTex->Name = "stoneTex";
+	stoneTex->Filename = L"../../Textures/stone.dds";
+	ThrowIfFailed(DirectX::CreateDDSTextureFromFile12(md3dDevice.Get(),
+		mCommandList.Get(), stoneTex->Filename.c_str(),
+		stoneTex->Resource, stoneTex->UploadHeap));
 
-	// Need a CBV descriptor for each object for each frame resource,
-	// +1 for the perPass CBV for each frame resource.
-	UINT numDescriptors = (objCount + 1) * gNumFrameResources;
+	auto darkStoneTex = std::make_unique<Texture>();
+	darkStoneTex->Name = "darkStoneTex";
+	darkStoneTex->Filename = L"../../Textures/stone.dds";
+	ThrowIfFailed(DirectX::CreateDDSTextureFromFile12(md3dDevice.Get(),
+		mCommandList.Get(), darkStoneTex->Filename.c_str(),
+		darkStoneTex->Resource, darkStoneTex->UploadHeap));
 
-	// Save an offset to the start of the pass CBVs.  These are the last 3 descriptors.
-	mPassCbvOffset = objCount * gNumFrameResources;
+	auto brickTex = std::make_unique<Texture>();
+	brickTex->Name = "brickTex";
+	brickTex->Filename = L"../../Textures/bricks.dds";
+	ThrowIfFailed(DirectX::CreateDDSTextureFromFile12(md3dDevice.Get(),
+		mCommandList.Get(), brickTex->Filename.c_str(),
+		brickTex->Resource, brickTex->UploadHeap));
 
-	D3D12_DESCRIPTOR_HEAP_DESC cbvHeapDesc;
-	cbvHeapDesc.NumDescriptors = numDescriptors;
-	cbvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-	cbvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-	cbvHeapDesc.NodeMask = 0;
-	ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&cbvHeapDesc,
-		IID_PPV_ARGS(&mCbvHeap)));
+	auto roofTex = std::make_unique<Texture>();
+	roofTex->Name = "roofTex";
+	roofTex->Filename = L"../../Textures/tile.dds";
+	ThrowIfFailed(DirectX::CreateDDSTextureFromFile12(md3dDevice.Get(),
+		mCommandList.Get(), roofTex->Filename.c_str(),
+		roofTex->Resource, roofTex->UploadHeap));
+
+	auto goldTex = std::make_unique<Texture>();
+	goldTex->Name = "goldTex";
+	goldTex->Filename = L"../../Textures/bricks.dds";
+	ThrowIfFailed(DirectX::CreateDDSTextureFromFile12(md3dDevice.Get(),
+		mCommandList.Get(), goldTex->Filename.c_str(),
+		goldTex->Resource, goldTex->UploadHeap));
+
+	auto waterTex = std::make_unique<Texture>();
+	waterTex->Name = "waterTex";
+	waterTex->Filename = L"../../Textures/water1.dds";
+	ThrowIfFailed(DirectX::CreateDDSTextureFromFile12(md3dDevice.Get(),
+		mCommandList.Get(), waterTex->Filename.c_str(),
+		waterTex->Resource, waterTex->UploadHeap));
+
+	auto treeArrayTex = std::make_unique<Texture>();
+	treeArrayTex->Name = "treeArrayTex";
+	treeArrayTex->Filename = L"../../Textures/treeArray2.dds";
+	ThrowIfFailed(DirectX::CreateDDSTextureFromFile12(md3dDevice.Get(),
+		mCommandList.Get(), treeArrayTex->Filename.c_str(),
+		treeArrayTex->Resource, treeArrayTex->UploadHeap));
+
+
+	mTextures[stoneTex->Name] = std::move(stoneTex);
+	mTextures[darkStoneTex->Name] = std::move(darkStoneTex);
+	mTextures[brickTex->Name] = std::move(brickTex);
+	mTextures[roofTex->Name] = std::move(roofTex);
+	mTextures[goldTex->Name] = std::move(goldTex);
+	mTextures[treeArrayTex->Name] = std::move(treeArrayTex);
+	mTextures["waterTex"] = std::move(waterTex);
 }
 
-void ShapesApp::BuildConstantBufferViews()
+
+void ShapesApp::BuildDescriptorHeaps()
 {
-	UINT objCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(ObjectConstants));
+	// Create the SRV heap.
+	D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
+	srvHeapDesc.NumDescriptors = (UINT)mTextures.size();
+	srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+	ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&mSrvDescriptorHeap)));
 
-	UINT objCount = (UINT)mOpaqueRitems.size();
+	// Fill out the heap with actual descriptors.
+	CD3DX12_CPU_DESCRIPTOR_HANDLE hDescriptor(mSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
 
-	// Need a CBV descriptor for each object for each frame resource.
-	for (int frameIndex = 0; frameIndex < gNumFrameResources; ++frameIndex)
+	for (auto& texPair : mTextures)
 	{
-		auto objectCB = mFrameResources[frameIndex]->ObjectCB->Resource();
-		for (UINT i = 0; i < objCount; ++i)
+		auto texture = texPair.second->Resource;
+		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+
+		auto desc = texture->GetDesc();
+
+		// Check if this is the tree texture array
+		if (texPair.first == "treeArrayTex")
 		{
-			D3D12_GPU_VIRTUAL_ADDRESS cbAddress = objectCB->GetGPUVirtualAddress();
-
-			// Offset to the ith object constant buffer in the buffer.
-			cbAddress += i * objCBByteSize;
-
-			// Offset to the object cbv in the descriptor heap.
-			int heapIndex = frameIndex * objCount + i;
-			auto handle = CD3DX12_CPU_DESCRIPTOR_HANDLE(mCbvHeap->GetCPUDescriptorHandleForHeapStart());
-			handle.Offset(heapIndex, mCbvSrvUavDescriptorSize);
-
-			D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc;
-			cbvDesc.BufferLocation = cbAddress;
-			cbvDesc.SizeInBytes = objCBByteSize;
-
-			md3dDevice->CreateConstantBufferView(&cbvDesc, handle);
+			srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+			srvDesc.Format = desc.Format;
+			srvDesc.Texture2DArray.MostDetailedMip = 0;
+			srvDesc.Texture2DArray.MipLevels = -1;
+			srvDesc.Texture2DArray.FirstArraySlice = 0;
+			srvDesc.Texture2DArray.ArraySize = desc.DepthOrArraySize;
 		}
-	}
+		else
+		{
+			srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			srvDesc.Format = desc.Format;
+			srvDesc.Texture2D.MostDetailedMip = 0;
+			srvDesc.Texture2D.MipLevels = desc.MipLevels;
+			srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+		}
 
-	UINT passCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(PassConstants));
-
-	// Last three descriptors are the pass CBVs for each frame resource.
-	for (int frameIndex = 0; frameIndex < gNumFrameResources; ++frameIndex)
-	{
-		auto passCB = mFrameResources[frameIndex]->PassCB->Resource();
-		D3D12_GPU_VIRTUAL_ADDRESS cbAddress = passCB->GetGPUVirtualAddress();
-
-		// Offset to the pass cbv in the descriptor heap.
-		int heapIndex = mPassCbvOffset + frameIndex;
-		auto handle = CD3DX12_CPU_DESCRIPTOR_HANDLE(mCbvHeap->GetCPUDescriptorHandleForHeapStart());
-		handle.Offset(heapIndex, mCbvSrvUavDescriptorSize);
-
-		D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc;
-		cbvDesc.BufferLocation = cbAddress;
-		cbvDesc.SizeInBytes = passCBByteSize;
-
-		md3dDevice->CreateConstantBufferView(&cbvDesc, handle);
+		md3dDevice->CreateShaderResourceView(texture.Get(), &srvDesc, hDescriptor);
+		hDescriptor.Offset(1, mCbvSrvDescriptorSize);
 	}
 }
 
 void ShapesApp::BuildRootSignature()
 {
-	CD3DX12_DESCRIPTOR_RANGE cbvTable0;
-	cbvTable0.Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0);
-
-	CD3DX12_DESCRIPTOR_RANGE cbvTable1;
-	cbvTable1.Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1);
+	CD3DX12_DESCRIPTOR_RANGE texTable;
+	texTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // register t0
 
 	// Root parameter can be a table, root descriptor or root constants.
-	CD3DX12_ROOT_PARAMETER slotRootParameter[2];
+	CD3DX12_ROOT_PARAMETER slotRootParameter[4];
 
-	// Create root CBVs.
-	slotRootParameter[0].InitAsDescriptorTable(1, &cbvTable0);
-	slotRootParameter[1].InitAsDescriptorTable(1, &cbvTable1);
+	// Perfomance TIP: Order from most frequent to least frequent.
+	slotRootParameter[0].InitAsDescriptorTable(1, &texTable, D3D12_SHADER_VISIBILITY_PIXEL);
+	slotRootParameter[1].InitAsConstantBufferView(0); // register b0 (ObjectCB)
+	slotRootParameter[2].InitAsConstantBufferView(1); // register b1 (PassCB)
+	slotRootParameter[3].InitAsConstantBufferView(2); // register b2 (MaterialCB)
+
+	auto staticSamplers = GetStaticSamplers();
 
 	// A root signature is an array of root parameters.
-	CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(2, slotRootParameter, 0, nullptr,
+	CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(4, slotRootParameter,
+		(UINT)staticSamplers.size(), staticSamplers.data(),
 		D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
 
 	// create a root signature with a single slot which points to a descriptor range consisting of a single constant buffer
@@ -524,13 +623,33 @@ void ShapesApp::BuildRootSignature()
 
 void ShapesApp::BuildShadersAndInputLayout()
 {
-	mShaders["standardVS"] = d3dUtil::CompileShader(L"Shaders\\VS.hlsl", nullptr, "VS", "vs_5_1");
-	mShaders["opaquePS"] = d3dUtil::CompileShader(L"Shaders\\PS.hlsl", nullptr, "PS", "ps_5_1");
+	mShaders["standardVS"] = d3dUtil::CompileShader(L"Shaders\\Default.hlsl", nullptr, "VS", "vs_5_0");
+	mShaders["opaquePS"] = d3dUtil::CompileShader(L"Shaders\\Default.hlsl", nullptr, "PS", "ps_5_0");
+
+	// ========== ADD TREE SPRITE SHADERS ==========
+	const D3D_SHADER_MACRO alphaTestDefines[] =
+	{
+		"ALPHA_TEST",
+		NULL, NULL
+	};
+
+	mShaders["treeSpriteVS"] = d3dUtil::CompileShader(L"Shaders\\TreeSprite.hlsl", nullptr, "VS", "vs_5_0");
+	mShaders["treeSpriteGS"] = d3dUtil::CompileShader(L"Shaders\\TreeSprite.hlsl", nullptr, "GS", "gs_5_0");
+	mShaders["treeSpritePS"] = d3dUtil::CompileShader(L"Shaders\\TreeSprite.hlsl", alphaTestDefines, "PS", "ps_5_0");
+	// ========== END ADDED ==========
 
 	mInputLayout =
 	{
 		{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-		{ "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+		{ "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+		{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+	};
+
+	// ========== ADD TREE SPRITE INPUT LAYOUT ==========
+	mTreeSpriteInputLayout =
+	{
+		{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+		{ "SIZE", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
 	};
 }
 
@@ -707,98 +826,112 @@ void ShapesApp::BuildShapeGeometry()
 	for (size_t i = 0; i < ground.Vertices.size(); ++i, ++k)
 	{
 		vertices[k].Pos = ground.Vertices[i].Position;
-		vertices[k].Color = XMFLOAT4(DirectX::Colors::DarkGreen);
+		vertices[k].Normal = ground.Vertices[i].Normal;
+		vertices[k].TexC = ground.Vertices[i].TexC;
 	}
 
 	// Keep Foundation - dark gray
 	for (size_t i = 0; i < keepFoundation.Vertices.size(); ++i, ++k)
 	{
 		vertices[k].Pos = keepFoundation.Vertices[i].Position;
-		vertices[k].Color = XMFLOAT4(DirectX::Colors::DarkGray);
+		vertices[k].Normal = keepFoundation.Vertices[i].Normal;
+		vertices[k].TexC = keepFoundation.Vertices[i].TexC;
 	}
 
 	// Keep Body - light gray
 	for (size_t i = 0; i < keepBody.Vertices.size(); ++i, ++k)
 	{
 		vertices[k].Pos = keepBody.Vertices[i].Position;
-		vertices[k].Color = XMFLOAT4(DirectX::Colors::LightGray);
+		vertices[k].Normal = keepBody.Vertices[i].Normal;
+		vertices[k].TexC = keepBody.Vertices[i].TexC;
 	}
 
 	// Outer Walls Long - stone gray
 	for (size_t i = 0; i < outerWallLong.Vertices.size(); ++i, ++k)
 	{
 		vertices[k].Pos = outerWallLong.Vertices[i].Position;
-		vertices[k].Color = XMFLOAT4(0.6f, 0.6f, 0.6f, 1.0f);
+		vertices[k].Normal = outerWallLong.Vertices[i].Normal;
+		vertices[k].TexC = outerWallLong.Vertices[i].TexC;
 	}
 
 	// Outer Walls Short - stone gray
 	for (size_t i = 0; i < outerWallShort.Vertices.size(); ++i, ++k)
 	{
 		vertices[k].Pos = outerWallShort.Vertices[i].Position;
-		vertices[k].Color = XMFLOAT4(0.6f, 0.6f, 0.6f, 1.0f);
+		vertices[k].Normal = outerWallShort.Vertices[i].Normal;
+		vertices[k].TexC = outerWallShort.Vertices[i].TexC;
 	}
 
 	// Hexagonal Towers - medium gray
 	for (size_t i = 0; i < hexTower.Vertices.size(); ++i, ++k)
 	{
 		vertices[k].Pos = hexTower.Vertices[i].Position;
-		vertices[k].Color = XMFLOAT4(DirectX::Colors::Gray);
+		vertices[k].Normal = hexTower.Vertices[i].Normal;
+		vertices[k].TexC = hexTower.Vertices[i].TexC;
 	}
 
 	// Torus Roofs - dark brown
 	for (size_t i = 0; i < torusRoof.Vertices.size(); ++i, ++k)
 	{
 		vertices[k].Pos = torusRoof.Vertices[i].Position;
-		vertices[k].Color = XMFLOAT4(0.4f, 0.2f, 0.1f, 1.0f);
+		vertices[k].Normal = torusRoof.Vertices[i].Normal;
+		vertices[k].TexC = torusRoof.Vertices[i].TexC;
 	}
 
 	// Keep Pyramid Roof - dark red
 	for (size_t i = 0; i < keepPyramidRoof.Vertices.size(); ++i, ++k)
 	{
 		vertices[k].Pos = keepPyramidRoof.Vertices[i].Position;
-		vertices[k].Color = XMFLOAT4(DirectX::Colors::DarkRed);
+		vertices[k].Normal = keepPyramidRoof.Vertices[i].Normal;
+		vertices[k].TexC = keepPyramidRoof.Vertices[i].TexC;
 	}
 
 	// Keep Cone Roofs - dark brown
 	for (size_t i = 0; i < keepConeRoof.Vertices.size(); ++i, ++k)
 	{
 		vertices[k].Pos = keepConeRoof.Vertices[i].Position;
-		vertices[k].Color = XMFLOAT4(0.4f, 0.2f, 0.1f, 1.0f);
+		vertices[k].Normal = keepConeRoof.Vertices[i].Normal;
+		vertices[k].TexC = keepConeRoof.Vertices[i].TexC;
 	}
 
 	// Diamond Spire - gold
 	for (size_t i = 0; i < diamondSpire.Vertices.size(); ++i, ++k)
 	{
 		vertices[k].Pos = diamondSpire.Vertices[i].Position;
-		vertices[k].Color = XMFLOAT4(DirectX::Colors::Gold);
+		vertices[k].Normal = diamondSpire.Vertices[i].Normal;
+		vertices[k].TexC = diamondSpire.Vertices[i].TexC;
 	}
 
 	// Arrow Slits - black
 	for (size_t i = 0; i < arrowSlit.Vertices.size(); ++i, ++k)
 	{
 		vertices[k].Pos = arrowSlit.Vertices[i].Position;
-		vertices[k].Color = XMFLOAT4(DirectX::Colors::Black);
+		vertices[k].Normal = arrowSlit.Vertices[i].Normal;
+		vertices[k].TexC = arrowSlit.Vertices[i].TexC;
 	}
 
 	// Gable Wedges - medium gray
 	for (size_t i = 0; i < gableWedge.Vertices.size(); ++i, ++k)
 	{
 		vertices[k].Pos = gableWedge.Vertices[i].Position;
-		vertices[k].Color = XMFLOAT4(0.7f, 0.7f, 0.7f, 1.0f);
+		vertices[k].Normal = gableWedge.Vertices[i].Normal;
+		vertices[k].TexC = gableWedge.Vertices[i].TexC;
 	}
 
 	// Gate Columns - Dark Gray
 	for (size_t i = 0; i < gateColumn.Vertices.size(); ++i, ++k)
 	{
 		vertices[k].Pos = gateColumn.Vertices[i].Position;
-		vertices[k].Color = XMFLOAT4(0.3f, 0.3f, 0.3f, 1.0f);
+		vertices[k].Normal = gateColumn.Vertices[i].Normal;
+		vertices[k].TexC = gateColumn.Vertices[i].TexC;
 	}
 
 	// Gatehouse - Medium Gray
 	for (size_t i = 0; i < gatehouse.Vertices.size(); ++i, ++k)
 	{
 		vertices[k].Pos = gatehouse.Vertices[i].Position;
-		vertices[k].Color = XMFLOAT4(0.5f, 0.5f, 0.5f, 1.0f);
+		vertices[k].Normal = gatehouse.Vertices[i].Normal;
+		vertices[k].TexC = gatehouse.Vertices[i].TexC;
 	}
 
 
@@ -859,14 +992,134 @@ void ShapesApp::BuildShapeGeometry()
 	geo->DrawArgs["gatehouse"] = gatehouseSubmesh;
 
 	mGeometries[geo->Name] = std::move(geo);
-	
+
+}
+
+void ShapesApp::BuildWaterGeometry()
+{
+	GeometryGenerator geoGen;
+
+	// Create a large water plane (200x200 units to surround the castle)
+	GeometryGenerator::MeshData waterPlane = geoGen.CreateGrid(200.0f, 200.0f, 100, 100);
+
+	std::vector<Vertex> vertices(waterPlane.Vertices.size());
+	for (size_t i = 0; i < waterPlane.Vertices.size(); ++i)
+	{
+		vertices[i].Pos = waterPlane.Vertices[i].Position;
+		vertices[i].Pos.y = -0.7f; // Place water slightly below ground
+		vertices[i].Normal = waterPlane.Vertices[i].Normal;
+		vertices[i].TexC = waterPlane.Vertices[i].TexC;
+	}
+
+	std::vector<std::uint16_t> indices = waterPlane.GetIndices16();
+
+	const UINT vbByteSize = (UINT)vertices.size() * sizeof(Vertex);
+	const UINT ibByteSize = (UINT)indices.size() * sizeof(std::uint16_t);
+
+	auto geo = std::make_unique<MeshGeometry>();
+	geo->Name = "waterGeo";
+
+	ThrowIfFailed(D3DCreateBlob(vbByteSize, &geo->VertexBufferCPU));
+	CopyMemory(geo->VertexBufferCPU->GetBufferPointer(), vertices.data(), vbByteSize);
+
+	ThrowIfFailed(D3DCreateBlob(ibByteSize, &geo->IndexBufferCPU));
+	CopyMemory(geo->IndexBufferCPU->GetBufferPointer(), indices.data(), ibByteSize);
+
+	geo->VertexBufferGPU = d3dUtil::CreateDefaultBuffer(md3dDevice.Get(),
+		mCommandList.Get(), vertices.data(), vbByteSize, geo->VertexBufferUploader);
+
+	geo->IndexBufferGPU = d3dUtil::CreateDefaultBuffer(md3dDevice.Get(),
+		mCommandList.Get(), indices.data(), ibByteSize, geo->IndexBufferUploader);
+
+	geo->VertexByteStride = sizeof(Vertex);
+	geo->VertexBufferByteSize = vbByteSize;
+	geo->IndexFormat = DXGI_FORMAT_R16_UINT;
+	geo->IndexBufferByteSize = ibByteSize;
+
+	SubmeshGeometry submesh;
+	submesh.IndexCount = (UINT)indices.size();
+	submesh.StartIndexLocation = 0;
+	submesh.BaseVertexLocation = 0;
+
+	geo->DrawArgs["water"] = submesh;
+
+	mGeometries["waterGeo"] = std::move(geo);
+}
+
+void ShapesApp::BuildTreeSpritesGeometry()
+{
+	struct TreeVertex
+	{
+		XMFLOAT3 Pos;
+		XMFLOAT2 Size;
+	};
+
+	// Create 30 trees randomly placed around the castle
+	const int treeCount = 30;
+	std::vector<TreeVertex> vertices(treeCount);
+
+	for (int i = 0; i < treeCount; ++i)
+	{
+		// Random angle and distance from castle
+		float angle = MathHelper::RandF(0.0f, XM_2PI);
+		float radius = MathHelper::RandF(18.0f, 45.0f);
+
+		float x = cosf(angle) * radius;
+		float z = sinf(angle) * radius;
+
+		// Ground height (flat at -0.5f)
+		float groundY = -0.5f;
+		float treeY = groundY + 5.0f;
+
+		vertices[i].Pos = XMFLOAT3(x, treeY, z);
+
+		// Random tree size (width 5-10, height 8-14)
+		float width = MathHelper::RandF(5.0f, 10.0f);
+		float height = MathHelper::RandF(8.0f, 14.0f);
+		vertices[i].Size = XMFLOAT2(width, height);
+	}
+
+	// Create indices (each point is its own primitive)
+	std::vector<std::uint16_t> indices;
+	for (int i = 0; i < treeCount; ++i)
+		indices.push_back(i);
+
+	const UINT vbByteSize = (UINT)vertices.size() * sizeof(TreeVertex);
+	const UINT ibByteSize = (UINT)indices.size() * sizeof(std::uint16_t);
+
+	auto geo = std::make_unique<MeshGeometry>();
+	geo->Name = "treeGeo";
+
+	ThrowIfFailed(D3DCreateBlob(vbByteSize, &geo->VertexBufferCPU));
+	CopyMemory(geo->VertexBufferCPU->GetBufferPointer(), vertices.data(), vbByteSize);
+
+	ThrowIfFailed(D3DCreateBlob(ibByteSize, &geo->IndexBufferCPU));
+	CopyMemory(geo->IndexBufferCPU->GetBufferPointer(), indices.data(), ibByteSize);
+
+	geo->VertexBufferGPU = d3dUtil::CreateDefaultBuffer(md3dDevice.Get(),
+		mCommandList.Get(), vertices.data(), vbByteSize, geo->VertexBufferUploader);
+
+	geo->IndexBufferGPU = d3dUtil::CreateDefaultBuffer(md3dDevice.Get(),
+		mCommandList.Get(), indices.data(), ibByteSize, geo->IndexBufferUploader);
+
+	geo->VertexByteStride = sizeof(TreeVertex);
+	geo->VertexBufferByteSize = vbByteSize;
+	geo->IndexFormat = DXGI_FORMAT_R16_UINT;
+	geo->IndexBufferByteSize = ibByteSize;
+
+	SubmeshGeometry submesh;
+	submesh.IndexCount = (UINT)indices.size();
+	submesh.StartIndexLocation = 0;
+	submesh.BaseVertexLocation = 0;
+
+	geo->DrawArgs["points"] = submesh;
+
+	mGeometries["treeGeo"] = std::move(geo);
 }
 
 void ShapesApp::BuildPSOs()
 {
 	D3D12_GRAPHICS_PIPELINE_STATE_DESC opaquePsoDesc;
-
-	// PSO for opaque objects.
 
 	ZeroMemory(&opaquePsoDesc, sizeof(D3D12_GRAPHICS_PIPELINE_STATE_DESC));
 	opaquePsoDesc.InputLayout = { mInputLayout.data(), (UINT)mInputLayout.size() };
@@ -874,14 +1127,14 @@ void ShapesApp::BuildPSOs()
 
 	opaquePsoDesc.VS =
 	{
-	 reinterpret_cast<BYTE*>(mShaders["standardVS"]->GetBufferPointer()),
-	 mShaders["standardVS"]->GetBufferSize()
+		reinterpret_cast<BYTE*>(mShaders["standardVS"]->GetBufferPointer()),
+		mShaders["standardVS"]->GetBufferSize()
 	};
 
 	opaquePsoDesc.PS =
 	{
-	 reinterpret_cast<BYTE*>(mShaders["opaquePS"]->GetBufferPointer()),
-	 mShaders["opaquePS"]->GetBufferSize()
+		reinterpret_cast<BYTE*>(mShaders["opaquePS"]->GetBufferPointer()),
+		mShaders["opaquePS"]->GetBufferSize()
 	};
 
 	opaquePsoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
@@ -898,155 +1151,354 @@ void ShapesApp::BuildPSOs()
 
 	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&opaquePsoDesc, IID_PPV_ARGS(&mPSOs["opaque"])));
 
-	// PSO for opaque wireframe objects.
-
+	// PSO for opaque wireframe objects
 	D3D12_GRAPHICS_PIPELINE_STATE_DESC opaqueWireframePsoDesc = opaquePsoDesc;
 	opaqueWireframePsoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
 	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&opaqueWireframePsoDesc, IID_PPV_ARGS(&mPSOs["opaque_wireframe"])));
+
+	// PSO for transparent objects (water)
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC transparentPsoDesc = opaquePsoDesc;
+
+	D3D12_RENDER_TARGET_BLEND_DESC transparencyBlendDesc;
+	transparencyBlendDesc.BlendEnable = true;
+	transparencyBlendDesc.LogicOpEnable = false;
+	transparencyBlendDesc.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+	transparencyBlendDesc.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+	transparencyBlendDesc.BlendOp = D3D12_BLEND_OP_ADD;
+	transparencyBlendDesc.SrcBlendAlpha = D3D12_BLEND_ONE;
+	transparencyBlendDesc.DestBlendAlpha = D3D12_BLEND_ZERO;
+	transparencyBlendDesc.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+	transparencyBlendDesc.LogicOp = D3D12_LOGIC_OP_NOOP;
+	transparencyBlendDesc.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+	transparentPsoDesc.BlendState.RenderTarget[0] = transparencyBlendDesc;
+	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&transparentPsoDesc, IID_PPV_ARGS(&mPSOs["transparent"])));
+
+	// ========== PSO for TREE SPRITES (with Geometry Shader) ==========
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC treePsoDesc = opaquePsoDesc;
+
+	// Use tree sprite shaders
+	treePsoDesc.VS =
+	{
+		reinterpret_cast<BYTE*>(mShaders["treeSpriteVS"]->GetBufferPointer()),
+		mShaders["treeSpriteVS"]->GetBufferSize()
+	};
+
+	treePsoDesc.GS =
+	{
+		reinterpret_cast<BYTE*>(mShaders["treeSpriteGS"]->GetBufferPointer()),
+		mShaders["treeSpriteGS"]->GetBufferSize()
+	};
+
+	treePsoDesc.PS =
+	{
+		reinterpret_cast<BYTE*>(mShaders["treeSpritePS"]->GetBufferPointer()),
+		mShaders["treeSpritePS"]->GetBufferSize()
+	};
+
+	// Use tree sprite input layout
+	treePsoDesc.InputLayout = { mTreeSpriteInputLayout.data(), (UINT)mTreeSpriteInputLayout.size() };
+
+	// Set primitive topology type to POINT (since we're drawing points)
+	treePsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+
+	// Create the PSO
+	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&treePsoDesc, IID_PPV_ARGS(&mPSOs["treeSprites"])));
 }
-
-
 
 void ShapesApp::BuildFrameResources()
 {
 	for (int i = 0; i < gNumFrameResources; ++i)
 	{
 		mFrameResources.push_back(std::make_unique<FrameResource>(md3dDevice.Get(),
-			1, (UINT)mAllRitems.size()));
+			1, (UINT)mAllRitems.size(), (UINT)mMaterials.size()));
 	}
 }
 
+void ShapesApp::BuildMaterials()
+{
+	int heapIndex = 0;
 
+	// Ground material - tile texture
+	auto groundMat = std::make_unique<Material>();
+	groundMat->Name = "groundMat";
+	groundMat->MatCBIndex = heapIndex++;
+	groundMat->DiffuseSrvHeapIndex = 3; // tileTex
+	groundMat->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+	groundMat->FresnelR0 = XMFLOAT3(0.05f, 0.05f, 0.05f);
+	groundMat->Roughness = 0.5f;
+
+	// Stone material
+	auto stoneMat = std::make_unique<Material>();
+	stoneMat->Name = "stoneMat";
+	stoneMat->MatCBIndex = heapIndex++;
+	stoneMat->DiffuseSrvHeapIndex = 0; // stoneTex
+	stoneMat->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+	stoneMat->FresnelR0 = XMFLOAT3(0.02f, 0.02f, 0.02f);
+	stoneMat->Roughness = 0.3f;
+
+	// Dark stone material
+	auto darkStoneMat = std::make_unique<Material>();
+	darkStoneMat->Name = "darkStoneMat";
+	darkStoneMat->MatCBIndex = heapIndex++;
+	darkStoneMat->DiffuseSrvHeapIndex = 0; // stoneTex
+	darkStoneMat->DiffuseAlbedo = XMFLOAT4(0.5f, 0.5f, 0.5f, 1.0f);
+	darkStoneMat->FresnelR0 = XMFLOAT3(0.02f, 0.02f, 0.02f);
+	darkStoneMat->Roughness = 0.4f;
+
+	// Brick material
+	auto brickMat = std::make_unique<Material>();
+	brickMat->Name = "brickMat";
+	brickMat->MatCBIndex = heapIndex++;
+	brickMat->DiffuseSrvHeapIndex = 2; // brickTex
+	brickMat->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+	brickMat->FresnelR0 = XMFLOAT3(0.03f, 0.03f, 0.03f);
+	brickMat->Roughness = 0.2f;
+
+	// Roof material
+	auto roofMat = std::make_unique<Material>();
+	roofMat->Name = "roofMat";
+	roofMat->MatCBIndex = heapIndex++;
+	roofMat->DiffuseSrvHeapIndex = 3; // roofTex
+	roofMat->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+	roofMat->FresnelR0 = XMFLOAT3(0.01f, 0.01f, 0.01f);
+	roofMat->Roughness = 0.6f;
+
+	// Gold material
+	auto goldMat = std::make_unique<Material>();
+	goldMat->Name = "goldMat";
+	goldMat->MatCBIndex = heapIndex++;
+	goldMat->DiffuseSrvHeapIndex = 4; // goldTex
+	goldMat->DiffuseAlbedo = XMFLOAT4(1.0f, 0.85f, 0.0f, 1.0f);
+	goldMat->FresnelR0 = XMFLOAT3(0.8f, 0.7f, 0.2f);
+	goldMat->Roughness = 0.1f;
+
+	// tree
+	auto treeMat = std::make_unique<Material>();
+	treeMat->Name = "treeMat";
+	treeMat->MatCBIndex = heapIndex++;
+	treeMat->DiffuseSrvHeapIndex = 5; // treeArrayTex
+	treeMat->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+	treeMat->FresnelR0 = XMFLOAT3(0.01f, 0.01f, 0.01f);
+	treeMat->Roughness = 0.2f;
+
+	// Water material with transparency
+	auto waterMat = std::make_unique<Material>();
+	waterMat->Name = "waterMat";
+	waterMat->MatCBIndex = heapIndex++;  // Next available index
+	waterMat->DiffuseSrvHeapIndex = 6;  // Index for water texture (since you have 5 textures)
+	waterMat->DiffuseAlbedo = XMFLOAT4(0.2f, 0.4f, 0.8f, 0.6f); // Blue, semi-transparent
+	waterMat->FresnelR0 = XMFLOAT3(0.1f, 0.1f, 0.1f);
+	waterMat->Roughness = 0.1f;
+
+
+	mMaterials["groundMat"] = std::move(groundMat);
+	mMaterials["stoneMat"] = std::move(stoneMat);
+	mMaterials["darkStoneMat"] = std::move(darkStoneMat);
+	mMaterials["brickMat"] = std::move(brickMat);
+	mMaterials["roofMat"] = std::move(roofMat);
+	mMaterials["goldMat"] = std::move(goldMat);
+	mMaterials["treeMat"] = std::move(treeMat);
+	mMaterials["waterMat"] = std::move(waterMat);
+	
+}
 
 void ShapesApp::BuildRenderItems()
 {
 	// Clear existing render items
 	mAllRitems.clear();
-	mOpaqueRitems.clear();
+	for (int i = 0; i < (int)RenderLayer::Count; ++i)
+		mRitemLayer[i].clear();
 
-	// GROUND
+	UINT objCBIndex = 0;
+
+	
+
+	// ========== WATER (Transparent Layer) ==========
+	auto waterRitem = std::make_unique<RenderItem>();
+	XMStoreFloat4x4(&waterRitem->World, XMMatrixTranslation(0.0f, -0.7f, 0.0f));
+	XMStoreFloat4x4(&waterRitem->TexTransform, XMMatrixScaling(8.0f, 8.0f, 1.0f));
+	waterRitem->ObjCBIndex = objCBIndex++;
+	waterRitem->Mat = mMaterials["waterMat"].get();
+	waterRitem->Geo = mGeometries["waterGeo"].get();
+	waterRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+	waterRitem->IndexCount = waterRitem->Geo->DrawArgs["water"].IndexCount;
+	waterRitem->StartIndexLocation = waterRitem->Geo->DrawArgs["water"].StartIndexLocation;
+	waterRitem->BaseVertexLocation = waterRitem->Geo->DrawArgs["water"].BaseVertexLocation;
+
+	mWaterRitem = waterRitem.get();
+	mRitemLayer[(int)RenderLayer::Transparent].push_back(waterRitem.get());
+	mAllRitems.push_back(std::move(waterRitem));
+
+	// TREEE
+	auto treeRitem = std::make_unique<RenderItem>();
+	XMStoreFloat4x4(&treeRitem->World, XMMatrixTranslation(0.0f, 0.0f, 0.0f));
+	XMStoreFloat4x4(&treeRitem->TexTransform, XMMatrixScaling(1.0f, 1.0f, 1.0f));
+	treeRitem->ObjCBIndex = objCBIndex++;
+	treeRitem->Mat = mMaterials["treeMat"].get();
+	treeRitem->Geo = mGeometries["treeGeo"].get();
+	treeRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+	treeRitem->IndexCount = treeRitem->Geo->DrawArgs["points"].IndexCount;
+	treeRitem->StartIndexLocation = treeRitem->Geo->DrawArgs["points"].StartIndexLocation;
+	treeRitem->BaseVertexLocation = treeRitem->Geo->DrawArgs["points"].BaseVertexLocation;
+
+	mRitemLayer[(int)RenderLayer::AlphaTestedTreeSprites].push_back(treeRitem.get());
+	mAllRitems.push_back(std::move(treeRitem));
+
+	// ========== GROUND (Opaque Layer) ==========
 	auto groundRitem = std::make_unique<RenderItem>();
 	XMStoreFloat4x4(&groundRitem->World, XMMatrixTranslation(0.0f, -0.5f, 0.0f));
-	groundRitem->ObjCBIndex = 0;
+	XMStoreFloat4x4(&groundRitem->TexTransform, XMMatrixScaling(8.0f, 8.0f, 1.0f));
+	groundRitem->ObjCBIndex = objCBIndex++;
+	groundRitem->Mat = mMaterials["groundMat"].get();
 	groundRitem->Geo = mGeometries["castleGeo"].get();
 	groundRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	groundRitem->IndexCount = groundRitem->Geo->DrawArgs["ground"].IndexCount;
 	groundRitem->StartIndexLocation = groundRitem->Geo->DrawArgs["ground"].StartIndexLocation;
 	groundRitem->BaseVertexLocation = groundRitem->Geo->DrawArgs["ground"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(groundRitem.get());
 	mAllRitems.push_back(std::move(groundRitem));
 
 	// FOUNDATION
 	auto keepFoundationRitem = std::make_unique<RenderItem>();
 	XMStoreFloat4x4(&keepFoundationRitem->World, XMMatrixTranslation(0.0f, 1.0f, 0.0f));
-	keepFoundationRitem->ObjCBIndex = 1;
+	XMStoreFloat4x4(&keepFoundationRitem->TexTransform, XMMatrixScaling(2.0f, 1.0f, 1.5f));
+	keepFoundationRitem->ObjCBIndex = objCBIndex++;
+	keepFoundationRitem->Mat = mMaterials["darkStoneMat"].get();
 	keepFoundationRitem->Geo = mGeometries["castleGeo"].get();
 	keepFoundationRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	keepFoundationRitem->IndexCount = keepFoundationRitem->Geo->DrawArgs["keepFoundation"].IndexCount;
 	keepFoundationRitem->StartIndexLocation = keepFoundationRitem->Geo->DrawArgs["keepFoundation"].StartIndexLocation;
 	keepFoundationRitem->BaseVertexLocation = keepFoundationRitem->Geo->DrawArgs["keepFoundation"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(keepFoundationRitem.get());
 	mAllRitems.push_back(std::move(keepFoundationRitem));
 
 	// BODY
 	auto keepBodyRitem = std::make_unique<RenderItem>();
 	XMStoreFloat4x4(&keepBodyRitem->World, XMMatrixTranslation(0.0f, 6.0f, 0.0f));
-	keepBodyRitem->ObjCBIndex = 2;
+	XMStoreFloat4x4(&keepBodyRitem->TexTransform, XMMatrixScaling(2.0f, 3.0f, 2.0f));
+	keepBodyRitem->ObjCBIndex = objCBIndex++;
+	keepBodyRitem->Mat = mMaterials["brickMat"].get();
 	keepBodyRitem->Geo = mGeometries["castleGeo"].get();
 	keepBodyRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	keepBodyRitem->IndexCount = keepBodyRitem->Geo->DrawArgs["keepBody"].IndexCount;
 	keepBodyRitem->StartIndexLocation = keepBodyRitem->Geo->DrawArgs["keepBody"].StartIndexLocation;
 	keepBodyRitem->BaseVertexLocation = keepBodyRitem->Geo->DrawArgs["keepBody"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(keepBodyRitem.get());
 	mAllRitems.push_back(std::move(keepBodyRitem));
 
 	// OUTER WALLS
-	UINT objCBIndex = 3;
-
 	// North Wall (facing +Z)
 	auto northWallRitem = std::make_unique<RenderItem>();
 	XMStoreFloat4x4(&northWallRitem->World, XMMatrixTranslation(0.0f, 3.0f, 30.0f));
+	XMStoreFloat4x4(&northWallRitem->TexTransform, XMMatrixScaling(6.0f, 1.0f, 1.0f));
 	northWallRitem->ObjCBIndex = objCBIndex++;
+	northWallRitem->Mat = mMaterials["stoneMat"].get();
 	northWallRitem->Geo = mGeometries["castleGeo"].get();
 	northWallRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	northWallRitem->IndexCount = northWallRitem->Geo->DrawArgs["outerWallLong"].IndexCount;
 	northWallRitem->StartIndexLocation = northWallRitem->Geo->DrawArgs["outerWallLong"].StartIndexLocation;
 	northWallRitem->BaseVertexLocation = northWallRitem->Geo->DrawArgs["outerWallLong"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(northWallRitem.get());
 	mAllRitems.push_back(std::move(northWallRitem));
 
 	// South Wall (facing -Z)
 	auto southWallRitem = std::make_unique<RenderItem>();
 	XMStoreFloat4x4(&southWallRitem->World, XMMatrixTranslation(0.0f, 3.0f, -30.0f));
+	XMStoreFloat4x4(&southWallRitem->TexTransform, XMMatrixScaling(6.0f, 1.0f, 1.0f));
 	southWallRitem->ObjCBIndex = objCBIndex++;
+	southWallRitem->Mat = mMaterials["stoneMat"].get();
 	southWallRitem->Geo = mGeometries["castleGeo"].get();
 	southWallRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	southWallRitem->IndexCount = southWallRitem->Geo->DrawArgs["outerWallLong"].IndexCount;
 	southWallRitem->StartIndexLocation = southWallRitem->Geo->DrawArgs["outerWallLong"].StartIndexLocation;
 	southWallRitem->BaseVertexLocation = southWallRitem->Geo->DrawArgs["outerWallLong"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(southWallRitem.get());
 	mAllRitems.push_back(std::move(southWallRitem));
 
 	// East Wall (facing +X)
 	auto eastWallRitem = std::make_unique<RenderItem>();
 	XMStoreFloat4x4(&eastWallRitem->World, XMMatrixTranslation(30.0f, 3.0f, 0.0f));
+	XMStoreFloat4x4(&eastWallRitem->TexTransform, XMMatrixScaling(6.0f, 1.0f, 1.0f));
 	eastWallRitem->ObjCBIndex = objCBIndex++;
+	eastWallRitem->Mat = mMaterials["stoneMat"].get();
 	eastWallRitem->Geo = mGeometries["castleGeo"].get();
 	eastWallRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	eastWallRitem->IndexCount = eastWallRitem->Geo->DrawArgs["outerWallShort"].IndexCount;
 	eastWallRitem->StartIndexLocation = eastWallRitem->Geo->DrawArgs["outerWallShort"].StartIndexLocation;
 	eastWallRitem->BaseVertexLocation = eastWallRitem->Geo->DrawArgs["outerWallShort"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(eastWallRitem.get());
 	mAllRitems.push_back(std::move(eastWallRitem));
 
 	// West Wall (facing -X)
 	auto westWallRitem = std::make_unique<RenderItem>();
 	XMStoreFloat4x4(&westWallRitem->World, XMMatrixTranslation(-30.0f, 3.0f, 0.0f));
+	XMStoreFloat4x4(&westWallRitem->TexTransform, XMMatrixScaling(6.0f, 1.0f, 1.0f));
 	westWallRitem->ObjCBIndex = objCBIndex++;
+	westWallRitem->Mat = mMaterials["stoneMat"].get();
 	westWallRitem->Geo = mGeometries["castleGeo"].get();
 	westWallRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	westWallRitem->IndexCount = westWallRitem->Geo->DrawArgs["outerWallShort"].IndexCount;
 	westWallRitem->StartIndexLocation = westWallRitem->Geo->DrawArgs["outerWallShort"].StartIndexLocation;
 	westWallRitem->BaseVertexLocation = westWallRitem->Geo->DrawArgs["outerWallShort"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(westWallRitem.get());
 	mAllRitems.push_back(std::move(westWallRitem));
 
 	// HEXAGONAL CORNER TOWERS
 	// Northwest Tower (-X, +Z)
 	auto nwTowerRitem = std::make_unique<RenderItem>();
 	XMStoreFloat4x4(&nwTowerRitem->World, XMMatrixTranslation(-30.0f, 1.0f, 30.0f));
+	XMStoreFloat4x4(&nwTowerRitem->TexTransform, XMMatrixScaling(1.0f, 2.0f, 1.0f));
 	nwTowerRitem->ObjCBIndex = objCBIndex++;
+	nwTowerRitem->Mat = mMaterials["brickMat"].get();
 	nwTowerRitem->Geo = mGeometries["castleGeo"].get();
 	nwTowerRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	nwTowerRitem->IndexCount = nwTowerRitem->Geo->DrawArgs["hexTower"].IndexCount;
 	nwTowerRitem->StartIndexLocation = nwTowerRitem->Geo->DrawArgs["hexTower"].StartIndexLocation;
 	nwTowerRitem->BaseVertexLocation = nwTowerRitem->Geo->DrawArgs["hexTower"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(nwTowerRitem.get());
 	mAllRitems.push_back(std::move(nwTowerRitem));
 
 	// Northeast Tower (+X, +Z)
 	auto neTowerRitem = std::make_unique<RenderItem>();
 	XMStoreFloat4x4(&neTowerRitem->World, XMMatrixTranslation(30.0f, 1.0f, 30.0f));
+	XMStoreFloat4x4(&neTowerRitem->TexTransform, XMMatrixScaling(1.0f, 2.0f, 1.0f));
 	neTowerRitem->ObjCBIndex = objCBIndex++;
+	neTowerRitem->Mat = mMaterials["brickMat"].get();
 	neTowerRitem->Geo = mGeometries["castleGeo"].get();
 	neTowerRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	neTowerRitem->IndexCount = neTowerRitem->Geo->DrawArgs["hexTower"].IndexCount;
 	neTowerRitem->StartIndexLocation = neTowerRitem->Geo->DrawArgs["hexTower"].StartIndexLocation;
 	neTowerRitem->BaseVertexLocation = neTowerRitem->Geo->DrawArgs["hexTower"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(neTowerRitem.get());
 	mAllRitems.push_back(std::move(neTowerRitem));
 
 	// Southwest Tower (-X, -Z)
 	auto swTowerRitem = std::make_unique<RenderItem>();
 	XMStoreFloat4x4(&swTowerRitem->World, XMMatrixTranslation(-30.0f, 1.0f, -30.0f));
+	XMStoreFloat4x4(&swTowerRitem->TexTransform, XMMatrixScaling(1.0f, 2.0f, 1.0f));
 	swTowerRitem->ObjCBIndex = objCBIndex++;
+	swTowerRitem->Mat = mMaterials["brickMat"].get();
 	swTowerRitem->Geo = mGeometries["castleGeo"].get();
 	swTowerRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	swTowerRitem->IndexCount = swTowerRitem->Geo->DrawArgs["hexTower"].IndexCount;
 	swTowerRitem->StartIndexLocation = swTowerRitem->Geo->DrawArgs["hexTower"].StartIndexLocation;
 	swTowerRitem->BaseVertexLocation = swTowerRitem->Geo->DrawArgs["hexTower"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(swTowerRitem.get());
 	mAllRitems.push_back(std::move(swTowerRitem));
 
 	// Southeast Tower (+X, -Z)
 	auto seTowerRitem = std::make_unique<RenderItem>();
 	XMStoreFloat4x4(&seTowerRitem->World, XMMatrixTranslation(30.0f, 1.0f, -30.0f));
+	XMStoreFloat4x4(&seTowerRitem->TexTransform, XMMatrixScaling(1.0f, 2.0f, 1.0f));
 	seTowerRitem->ObjCBIndex = objCBIndex++;
+	seTowerRitem->Mat = mMaterials["brickMat"].get();
 	seTowerRitem->Geo = mGeometries["castleGeo"].get();
 	seTowerRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	seTowerRitem->IndexCount = seTowerRitem->Geo->DrawArgs["hexTower"].IndexCount;
 	seTowerRitem->StartIndexLocation = seTowerRitem->Geo->DrawArgs["hexTower"].StartIndexLocation;
 	seTowerRitem->BaseVertexLocation = seTowerRitem->Geo->DrawArgs["hexTower"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(seTowerRitem.get());
 	mAllRitems.push_back(std::move(seTowerRitem));
 
 	// TORUS ROOFS ON TOWERS
@@ -1054,59 +1506,74 @@ void ShapesApp::BuildRenderItems()
 	auto nwTowerRoofRitem = std::make_unique<RenderItem>();
 	XMMATRIX nwRoofTransform = XMMatrixScaling(0.8f, 0.4f, 1.0f) * XMMatrixTranslation(-30.0f, 11.0f, 30.0f);
 	XMStoreFloat4x4(&nwTowerRoofRitem->World, nwRoofTransform);
+	XMStoreFloat4x4(&nwTowerRoofRitem->TexTransform, XMMatrixScaling(1.0f, 1.0f, 1.0f));
 	nwTowerRoofRitem->ObjCBIndex = objCBIndex++;
+	nwTowerRoofRitem->Mat = mMaterials["roofMat"].get();
 	nwTowerRoofRitem->Geo = mGeometries["castleGeo"].get();
 	nwTowerRoofRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	nwTowerRoofRitem->IndexCount = nwTowerRoofRitem->Geo->DrawArgs["torusRoof"].IndexCount;
 	nwTowerRoofRitem->StartIndexLocation = nwTowerRoofRitem->Geo->DrawArgs["torusRoof"].StartIndexLocation;
 	nwTowerRoofRitem->BaseVertexLocation = nwTowerRoofRitem->Geo->DrawArgs["torusRoof"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(nwTowerRoofRitem.get());
 	mAllRitems.push_back(std::move(nwTowerRoofRitem));
 
 	// Northeast Tower Roof
 	auto neTowerRoofRitem = std::make_unique<RenderItem>();
 	XMMATRIX neRoofTransform = XMMatrixScaling(0.8f, 0.4f, 1.0f) * XMMatrixTranslation(30.0f, 11.0f, 30.0f);
 	XMStoreFloat4x4(&neTowerRoofRitem->World, neRoofTransform);
+	XMStoreFloat4x4(&neTowerRoofRitem->TexTransform, XMMatrixScaling(1.0f, 1.0f, 1.0f));
 	neTowerRoofRitem->ObjCBIndex = objCBIndex++;
+	neTowerRoofRitem->Mat = mMaterials["roofMat"].get();
 	neTowerRoofRitem->Geo = mGeometries["castleGeo"].get();
 	neTowerRoofRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	neTowerRoofRitem->IndexCount = neTowerRoofRitem->Geo->DrawArgs["torusRoof"].IndexCount;
 	neTowerRoofRitem->StartIndexLocation = neTowerRoofRitem->Geo->DrawArgs["torusRoof"].StartIndexLocation;
 	neTowerRoofRitem->BaseVertexLocation = neTowerRoofRitem->Geo->DrawArgs["torusRoof"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(neTowerRoofRitem.get());
 	mAllRitems.push_back(std::move(neTowerRoofRitem));
 
 	// Southwest Tower Roof
 	auto swTowerRoofRitem = std::make_unique<RenderItem>();
 	XMMATRIX swRoofTransform = XMMatrixScaling(0.8f, 0.4f, 1.0f) * XMMatrixTranslation(-30.0f, 11.0f, -30.0f);
 	XMStoreFloat4x4(&swTowerRoofRitem->World, swRoofTransform);
+	XMStoreFloat4x4(&swTowerRoofRitem->TexTransform, XMMatrixScaling(1.0f, 1.0f, 1.0f));
 	swTowerRoofRitem->ObjCBIndex = objCBIndex++;
+	swTowerRoofRitem->Mat = mMaterials["roofMat"].get();
 	swTowerRoofRitem->Geo = mGeometries["castleGeo"].get();
 	swTowerRoofRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	swTowerRoofRitem->IndexCount = swTowerRoofRitem->Geo->DrawArgs["torusRoof"].IndexCount;
 	swTowerRoofRitem->StartIndexLocation = swTowerRoofRitem->Geo->DrawArgs["torusRoof"].StartIndexLocation;
 	swTowerRoofRitem->BaseVertexLocation = swTowerRoofRitem->Geo->DrawArgs["torusRoof"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(swTowerRoofRitem.get());
 	mAllRitems.push_back(std::move(swTowerRoofRitem));
 
 	// Southeast Tower Roof
 	auto seTowerRoofRitem = std::make_unique<RenderItem>();
 	XMMATRIX seRoofTransform = XMMatrixScaling(0.8f, 0.3f, 1.0f) * XMMatrixTranslation(30.0f, 11.0f, -30.0f);
 	XMStoreFloat4x4(&seTowerRoofRitem->World, seRoofTransform);
+	XMStoreFloat4x4(&seTowerRoofRitem->TexTransform, XMMatrixScaling(1.0f, 1.0f, 1.0f));
 	seTowerRoofRitem->ObjCBIndex = objCBIndex++;
+	seTowerRoofRitem->Mat = mMaterials["roofMat"].get();
 	seTowerRoofRitem->Geo = mGeometries["castleGeo"].get();
 	seTowerRoofRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	seTowerRoofRitem->IndexCount = seTowerRoofRitem->Geo->DrawArgs["torusRoof"].IndexCount;
 	seTowerRoofRitem->StartIndexLocation = seTowerRoofRitem->Geo->DrawArgs["torusRoof"].StartIndexLocation;
 	seTowerRoofRitem->BaseVertexLocation = seTowerRoofRitem->Geo->DrawArgs["torusRoof"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(seTowerRoofRitem.get());
 	mAllRitems.push_back(std::move(seTowerRoofRitem));
 
 	// KEEP PYRAMID ROOF
 	auto keepPyramidRoofRitem = std::make_unique<RenderItem>();
 	XMStoreFloat4x4(&keepPyramidRoofRitem->World, XMMatrixTranslation(0.0f, 25.0f, 0.0f));
+	XMStoreFloat4x4(&keepPyramidRoofRitem->TexTransform, XMMatrixScaling(2.0f, 2.0f, 1.5f));
 	keepPyramidRoofRitem->ObjCBIndex = objCBIndex++;
+	keepPyramidRoofRitem->Mat = mMaterials["roofMat"].get();
 	keepPyramidRoofRitem->Geo = mGeometries["castleGeo"].get();
 	keepPyramidRoofRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	keepPyramidRoofRitem->IndexCount = keepPyramidRoofRitem->Geo->DrawArgs["keepPyramidRoof"].IndexCount;
 	keepPyramidRoofRitem->StartIndexLocation = keepPyramidRoofRitem->Geo->DrawArgs["keepPyramidRoof"].StartIndexLocation;
 	keepPyramidRoofRitem->BaseVertexLocation = keepPyramidRoofRitem->Geo->DrawArgs["keepPyramidRoof"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(keepPyramidRoofRitem.get());
 	mAllRitems.push_back(std::move(keepPyramidRoofRitem));
 
 	// KEEP SIDE TOWERS
@@ -1114,48 +1581,60 @@ void ShapesApp::BuildRenderItems()
 	auto keepFrontLeftTowerRitem = std::make_unique<RenderItem>();
 	XMMATRIX frontLeftTowerScale = XMMatrixScaling(0.7f, 1.0f, 0.7f) * XMMatrixTranslation(-6.5f, 2.0f, -5.0f);
 	XMStoreFloat4x4(&keepFrontLeftTowerRitem->World, frontLeftTowerScale);
+	XMStoreFloat4x4(&keepFrontLeftTowerRitem->TexTransform, XMMatrixScaling(1.0f, 2.0f, 1.0f));
 	keepFrontLeftTowerRitem->ObjCBIndex = objCBIndex++;
+	keepFrontLeftTowerRitem->Mat = mMaterials["brickMat"].get();
 	keepFrontLeftTowerRitem->Geo = mGeometries["castleGeo"].get();
 	keepFrontLeftTowerRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	keepFrontLeftTowerRitem->IndexCount = keepFrontLeftTowerRitem->Geo->DrawArgs["hexTower"].IndexCount;
 	keepFrontLeftTowerRitem->StartIndexLocation = keepFrontLeftTowerRitem->Geo->DrawArgs["hexTower"].StartIndexLocation;
 	keepFrontLeftTowerRitem->BaseVertexLocation = keepFrontLeftTowerRitem->Geo->DrawArgs["hexTower"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(keepFrontLeftTowerRitem.get());
 	mAllRitems.push_back(std::move(keepFrontLeftTowerRitem));
 
 	// SE
 	auto keepFrontRightTowerRitem = std::make_unique<RenderItem>();
 	XMMATRIX frontRightTowerScale = XMMatrixScaling(0.7f, 1.0f, 0.7f) * XMMatrixTranslation(6.5f, 2.0f, -5.0f);
 	XMStoreFloat4x4(&keepFrontRightTowerRitem->World, frontRightTowerScale);
+	XMStoreFloat4x4(&keepFrontRightTowerRitem->TexTransform, XMMatrixScaling(1.0f, 2.0f, 1.0f));
 	keepFrontRightTowerRitem->ObjCBIndex = objCBIndex++;
+	keepFrontRightTowerRitem->Mat = mMaterials["brickMat"].get();
 	keepFrontRightTowerRitem->Geo = mGeometries["castleGeo"].get();
 	keepFrontRightTowerRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	keepFrontRightTowerRitem->IndexCount = keepFrontRightTowerRitem->Geo->DrawArgs["hexTower"].IndexCount;
 	keepFrontRightTowerRitem->StartIndexLocation = keepFrontRightTowerRitem->Geo->DrawArgs["hexTower"].StartIndexLocation;
 	keepFrontRightTowerRitem->BaseVertexLocation = keepFrontRightTowerRitem->Geo->DrawArgs["hexTower"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(keepFrontRightTowerRitem.get());
 	mAllRitems.push_back(std::move(keepFrontRightTowerRitem));
 
 	// NW
 	auto keepBackLeftTowerRitem = std::make_unique<RenderItem>();
 	XMMATRIX backLeftTowerScale = XMMatrixScaling(0.7f, 1.0f, 0.7f) * XMMatrixTranslation(-6.5f, 2.0f, 5.0f);
 	XMStoreFloat4x4(&keepBackLeftTowerRitem->World, backLeftTowerScale);
+	XMStoreFloat4x4(&keepBackLeftTowerRitem->TexTransform, XMMatrixScaling(1.0f, 2.0f, 1.0f));
 	keepBackLeftTowerRitem->ObjCBIndex = objCBIndex++;
+	keepBackLeftTowerRitem->Mat = mMaterials["brickMat"].get();
 	keepBackLeftTowerRitem->Geo = mGeometries["castleGeo"].get();
 	keepBackLeftTowerRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	keepBackLeftTowerRitem->IndexCount = keepBackLeftTowerRitem->Geo->DrawArgs["hexTower"].IndexCount;
 	keepBackLeftTowerRitem->StartIndexLocation = keepBackLeftTowerRitem->Geo->DrawArgs["hexTower"].StartIndexLocation;
 	keepBackLeftTowerRitem->BaseVertexLocation = keepBackLeftTowerRitem->Geo->DrawArgs["hexTower"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(keepBackLeftTowerRitem.get());
 	mAllRitems.push_back(std::move(keepBackLeftTowerRitem));
 
 	// NE
 	auto keepBackRightTowerRitem = std::make_unique<RenderItem>();
 	XMMATRIX backRightTowerScale = XMMatrixScaling(0.7f, 1.0f, 0.7f) * XMMatrixTranslation(6.5f, 2.0f, 5.0f);
 	XMStoreFloat4x4(&keepBackRightTowerRitem->World, backRightTowerScale);
+	XMStoreFloat4x4(&keepBackRightTowerRitem->TexTransform, XMMatrixScaling(1.0f, 2.0f, 1.0f));
 	keepBackRightTowerRitem->ObjCBIndex = objCBIndex++;
+	keepBackRightTowerRitem->Mat = mMaterials["brickMat"].get();
 	keepBackRightTowerRitem->Geo = mGeometries["castleGeo"].get();
 	keepBackRightTowerRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	keepBackRightTowerRitem->IndexCount = keepBackRightTowerRitem->Geo->DrawArgs["hexTower"].IndexCount;
 	keepBackRightTowerRitem->StartIndexLocation = keepBackRightTowerRitem->Geo->DrawArgs["hexTower"].StartIndexLocation;
 	keepBackRightTowerRitem->BaseVertexLocation = keepBackRightTowerRitem->Geo->DrawArgs["hexTower"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(keepBackRightTowerRitem.get());
 	mAllRitems.push_back(std::move(keepBackRightTowerRitem));
 
 	// KEEP SIDE TOWER CONE ROOFS
@@ -1163,70 +1642,88 @@ void ShapesApp::BuildRenderItems()
 	auto keepFrontLeftConeRoofRitem = std::make_unique<RenderItem>();
 	XMMATRIX frontLeftConeTransform = XMMatrixScaling(0.8f, 1.7f, 0.7f) * XMMatrixTranslation(-6.5f, 16.0f, -5.0f);
 	XMStoreFloat4x4(&keepFrontLeftConeRoofRitem->World, frontLeftConeTransform);
+	XMStoreFloat4x4(&keepFrontLeftConeRoofRitem->TexTransform, XMMatrixScaling(1.0f, 1.0f, 1.0f));
 	keepFrontLeftConeRoofRitem->ObjCBIndex = objCBIndex++;
+	keepFrontLeftConeRoofRitem->Mat = mMaterials["roofMat"].get();
 	keepFrontLeftConeRoofRitem->Geo = mGeometries["castleGeo"].get();
 	keepFrontLeftConeRoofRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	keepFrontLeftConeRoofRitem->IndexCount = keepFrontLeftConeRoofRitem->Geo->DrawArgs["keepConeRoof"].IndexCount;
 	keepFrontLeftConeRoofRitem->StartIndexLocation = keepFrontLeftConeRoofRitem->Geo->DrawArgs["keepConeRoof"].StartIndexLocation;
 	keepFrontLeftConeRoofRitem->BaseVertexLocation = keepFrontLeftConeRoofRitem->Geo->DrawArgs["keepConeRoof"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(keepFrontLeftConeRoofRitem.get());
 	mAllRitems.push_back(std::move(keepFrontLeftConeRoofRitem));
 
 	// SE
 	auto keepFrontRightConeRoofRitem = std::make_unique<RenderItem>();
 	XMMATRIX frontRightConeTransform = XMMatrixScaling(0.8f, 1.7f, 0.7f) * XMMatrixTranslation(6.5f, 16.0f, -5.0f);
 	XMStoreFloat4x4(&keepFrontRightConeRoofRitem->World, frontRightConeTransform);
+	XMStoreFloat4x4(&keepFrontRightConeRoofRitem->TexTransform, XMMatrixScaling(1.0f, 1.0f, 1.0f));
 	keepFrontRightConeRoofRitem->ObjCBIndex = objCBIndex++;
+	keepFrontRightConeRoofRitem->Mat = mMaterials["roofMat"].get();
 	keepFrontRightConeRoofRitem->Geo = mGeometries["castleGeo"].get();
 	keepFrontRightConeRoofRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	keepFrontRightConeRoofRitem->IndexCount = keepFrontRightConeRoofRitem->Geo->DrawArgs["keepConeRoof"].IndexCount;
 	keepFrontRightConeRoofRitem->StartIndexLocation = keepFrontRightConeRoofRitem->Geo->DrawArgs["keepConeRoof"].StartIndexLocation;
 	keepFrontRightConeRoofRitem->BaseVertexLocation = keepFrontRightConeRoofRitem->Geo->DrawArgs["keepConeRoof"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(keepFrontRightConeRoofRitem.get());
 	mAllRitems.push_back(std::move(keepFrontRightConeRoofRitem));
 
 	// NW
 	auto keepBackLeftConeRoofRitem = std::make_unique<RenderItem>();
 	XMMATRIX backLeftConeTransform = XMMatrixScaling(0.8f, 1.7f, 0.7f) * XMMatrixTranslation(-6.5f, 16.0f, 5.0f);
 	XMStoreFloat4x4(&keepBackLeftConeRoofRitem->World, backLeftConeTransform);
+	XMStoreFloat4x4(&keepBackLeftConeRoofRitem->TexTransform, XMMatrixScaling(1.0f, 1.0f, 1.0f));
 	keepBackLeftConeRoofRitem->ObjCBIndex = objCBIndex++;
+	keepBackLeftConeRoofRitem->Mat = mMaterials["roofMat"].get();
 	keepBackLeftConeRoofRitem->Geo = mGeometries["castleGeo"].get();
 	keepBackLeftConeRoofRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	keepBackLeftConeRoofRitem->IndexCount = keepBackLeftConeRoofRitem->Geo->DrawArgs["keepConeRoof"].IndexCount;
 	keepBackLeftConeRoofRitem->StartIndexLocation = keepBackLeftConeRoofRitem->Geo->DrawArgs["keepConeRoof"].StartIndexLocation;
 	keepBackLeftConeRoofRitem->BaseVertexLocation = keepBackLeftConeRoofRitem->Geo->DrawArgs["keepConeRoof"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(keepBackLeftConeRoofRitem.get());
 	mAllRitems.push_back(std::move(keepBackLeftConeRoofRitem));
 
 	// NE
 	auto keepBackRightConeRoofRitem = std::make_unique<RenderItem>();
 	XMMATRIX backRightConeTransform = XMMatrixScaling(0.8f, 1.7f, 0.7f) * XMMatrixTranslation(6.5f, 16.0f, 5.0f);
 	XMStoreFloat4x4(&keepBackRightConeRoofRitem->World, backRightConeTransform);
+	XMStoreFloat4x4(&keepBackRightConeRoofRitem->TexTransform, XMMatrixScaling(1.0f, 1.0f, 1.0f));
 	keepBackRightConeRoofRitem->ObjCBIndex = objCBIndex++;
+	keepBackRightConeRoofRitem->Mat = mMaterials["roofMat"].get();
 	keepBackRightConeRoofRitem->Geo = mGeometries["castleGeo"].get();
 	keepBackRightConeRoofRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	keepBackRightConeRoofRitem->IndexCount = keepBackRightConeRoofRitem->Geo->DrawArgs["keepConeRoof"].IndexCount;
 	keepBackRightConeRoofRitem->StartIndexLocation = keepBackRightConeRoofRitem->Geo->DrawArgs["keepConeRoof"].StartIndexLocation;
 	keepBackRightConeRoofRitem->BaseVertexLocation = keepBackRightConeRoofRitem->Geo->DrawArgs["keepConeRoof"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(keepBackRightConeRoofRitem.get());
 	mAllRitems.push_back(std::move(keepBackRightConeRoofRitem));
 
 	// DIAMOND SPIRE
 	auto diamondSpireRitem = std::make_unique<RenderItem>();
 	XMStoreFloat4x4(&diamondSpireRitem->World, XMMatrixTranslation(0.0f, 31.0f, 0.0f));
+	XMStoreFloat4x4(&diamondSpireRitem->TexTransform, XMMatrixScaling(1.0f, 1.0f, 1.0f));
 	diamondSpireRitem->ObjCBIndex = objCBIndex++;
+	diamondSpireRitem->Mat = mMaterials["goldMat"].get();
 	diamondSpireRitem->Geo = mGeometries["castleGeo"].get();
 	diamondSpireRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	diamondSpireRitem->IndexCount = diamondSpireRitem->Geo->DrawArgs["diamondSpire"].IndexCount;
 	diamondSpireRitem->StartIndexLocation = diamondSpireRitem->Geo->DrawArgs["diamondSpire"].StartIndexLocation;
 	diamondSpireRitem->BaseVertexLocation = diamondSpireRitem->Geo->DrawArgs["diamondSpire"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(diamondSpireRitem.get());
 	mAllRitems.push_back(std::move(diamondSpireRitem));
 
 	// GATEHOUSE BASE 
 	auto gatehouseRitem = std::make_unique<RenderItem>();
 	XMStoreFloat4x4(&gatehouseRitem->World, XMMatrixTranslation(0.0f, 4.0f, 31.0f));
+	XMStoreFloat4x4(&gatehouseRitem->TexTransform, XMMatrixScaling(2.0f, 1.5f, 1.0f));
 	gatehouseRitem->ObjCBIndex = objCBIndex++;
+	gatehouseRitem->Mat = mMaterials["stoneMat"].get();
 	gatehouseRitem->Geo = mGeometries["castleGeo"].get();
 	gatehouseRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	gatehouseRitem->IndexCount = gatehouseRitem->Geo->DrawArgs["gatehouse"].IndexCount;
 	gatehouseRitem->StartIndexLocation = gatehouseRitem->Geo->DrawArgs["gatehouse"].StartIndexLocation;
 	gatehouseRitem->BaseVertexLocation = gatehouseRitem->Geo->DrawArgs["gatehouse"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(gatehouseRitem.get());
 	mAllRitems.push_back(std::move(gatehouseRitem));
 
 	// GATE TOWERS 
@@ -1234,49 +1731,61 @@ void ShapesApp::BuildRenderItems()
 	auto leftGateTowerRitem = std::make_unique<RenderItem>();
 	XMMATRIX leftGateTowerScale = XMMatrixScaling(0.6f, 1.0f, 0.6f) * XMMatrixTranslation(-8.0f, 1.0f, 31.0f);
 	XMStoreFloat4x4(&leftGateTowerRitem->World, leftGateTowerScale);
+	XMStoreFloat4x4(&leftGateTowerRitem->TexTransform, XMMatrixScaling(1.0f, 2.0f, 1.0f));
 	leftGateTowerRitem->ObjCBIndex = objCBIndex++;
+	leftGateTowerRitem->Mat = mMaterials["brickMat"].get();
 	leftGateTowerRitem->Geo = mGeometries["castleGeo"].get();
 	leftGateTowerRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	leftGateTowerRitem->IndexCount = leftGateTowerRitem->Geo->DrawArgs["hexTower"].IndexCount;
 	leftGateTowerRitem->StartIndexLocation = leftGateTowerRitem->Geo->DrawArgs["hexTower"].StartIndexLocation;
 	leftGateTowerRitem->BaseVertexLocation = leftGateTowerRitem->Geo->DrawArgs["hexTower"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(leftGateTowerRitem.get());
 	mAllRitems.push_back(std::move(leftGateTowerRitem));
 
 	// Right gate tower
 	auto rightGateTowerRitem = std::make_unique<RenderItem>();
 	XMMATRIX rightGateTowerScale = XMMatrixScaling(0.6f, 1.0f, 0.6f) * XMMatrixTranslation(8.0f, 1.0f, 31.0f);
 	XMStoreFloat4x4(&rightGateTowerRitem->World, rightGateTowerScale);
+	XMStoreFloat4x4(&rightGateTowerRitem->TexTransform, XMMatrixScaling(1.0f, 2.0f, 1.0f));
 	rightGateTowerRitem->ObjCBIndex = objCBIndex++;
+	rightGateTowerRitem->Mat = mMaterials["brickMat"].get();
 	rightGateTowerRitem->Geo = mGeometries["castleGeo"].get();
 	rightGateTowerRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	rightGateTowerRitem->IndexCount = rightGateTowerRitem->Geo->DrawArgs["hexTower"].IndexCount;
 	rightGateTowerRitem->StartIndexLocation = rightGateTowerRitem->Geo->DrawArgs["hexTower"].StartIndexLocation;
 	rightGateTowerRitem->BaseVertexLocation = rightGateTowerRitem->Geo->DrawArgs["hexTower"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(rightGateTowerRitem.get());
 	mAllRitems.push_back(std::move(rightGateTowerRitem));
 
 	// GATE TOWER ROOFS
 	// Left gate tower cone roof
 	auto leftGateConeRoofRitem = std::make_unique<RenderItem>();
-	XMMATRIX leftGateConeTransform = XMMatrixScaling(0.6f, 1.2f, 1.0f) * XMMatrixTranslation(-8.0f, 13.5f, 31.0f); 
+	XMMATRIX leftGateConeTransform = XMMatrixScaling(0.6f, 1.2f, 1.0f) * XMMatrixTranslation(-8.0f, 13.5f, 31.0f);
 	XMStoreFloat4x4(&leftGateConeRoofRitem->World, leftGateConeTransform);
+	XMStoreFloat4x4(&leftGateConeRoofRitem->TexTransform, XMMatrixScaling(1.0f, 1.0f, 1.0f));
 	leftGateConeRoofRitem->ObjCBIndex = objCBIndex++;
+	leftGateConeRoofRitem->Mat = mMaterials["roofMat"].get();
 	leftGateConeRoofRitem->Geo = mGeometries["castleGeo"].get();
 	leftGateConeRoofRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	leftGateConeRoofRitem->IndexCount = leftGateConeRoofRitem->Geo->DrawArgs["keepConeRoof"].IndexCount;
 	leftGateConeRoofRitem->StartIndexLocation = leftGateConeRoofRitem->Geo->DrawArgs["keepConeRoof"].StartIndexLocation;
 	leftGateConeRoofRitem->BaseVertexLocation = leftGateConeRoofRitem->Geo->DrawArgs["keepConeRoof"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(leftGateConeRoofRitem.get());
 	mAllRitems.push_back(std::move(leftGateConeRoofRitem));
 
 	// Right gate tower cone roof
 	auto rightGateConeRoofRitem = std::make_unique<RenderItem>();
-	XMMATRIX rightGateConeTransform = XMMatrixScaling(0.6f, 1.2f, 1.0f) * XMMatrixTranslation(8.0f, 13.5f, 31.0f); 
+	XMMATRIX rightGateConeTransform = XMMatrixScaling(0.6f, 1.2f, 1.0f) * XMMatrixTranslation(8.0f, 13.5f, 31.0f);
 	XMStoreFloat4x4(&rightGateConeRoofRitem->World, rightGateConeTransform);
+	XMStoreFloat4x4(&rightGateConeRoofRitem->TexTransform, XMMatrixScaling(1.0f, 1.0f, 1.0f));
 	rightGateConeRoofRitem->ObjCBIndex = objCBIndex++;
+	rightGateConeRoofRitem->Mat = mMaterials["roofMat"].get();
 	rightGateConeRoofRitem->Geo = mGeometries["castleGeo"].get();
 	rightGateConeRoofRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	rightGateConeRoofRitem->IndexCount = rightGateConeRoofRitem->Geo->DrawArgs["keepConeRoof"].IndexCount;
 	rightGateConeRoofRitem->StartIndexLocation = rightGateConeRoofRitem->Geo->DrawArgs["keepConeRoof"].StartIndexLocation;
 	rightGateConeRoofRitem->BaseVertexLocation = rightGateConeRoofRitem->Geo->DrawArgs["keepConeRoof"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(rightGateConeRoofRitem.get());
 	mAllRitems.push_back(std::move(rightGateConeRoofRitem));
 
 	// GATE COLUMNS (cylinders flanking gate opening)
@@ -1284,24 +1793,30 @@ void ShapesApp::BuildRenderItems()
 	auto leftGateColumnRitem = std::make_unique<RenderItem>();
 	XMMATRIX leftColumnTransform = XMMatrixScaling(0.5f, 1.0f, 0.5f) * XMMatrixTranslation(-3.0f, 4.0f, 34.0f);
 	XMStoreFloat4x4(&leftGateColumnRitem->World, leftColumnTransform);
+	XMStoreFloat4x4(&leftGateColumnRitem->TexTransform, XMMatrixScaling(0.5f, 1.0f, 0.5f));
 	leftGateColumnRitem->ObjCBIndex = objCBIndex++;
+	leftGateColumnRitem->Mat = mMaterials["stoneMat"].get();
 	leftGateColumnRitem->Geo = mGeometries["castleGeo"].get();
 	leftGateColumnRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	leftGateColumnRitem->IndexCount = leftGateColumnRitem->Geo->DrawArgs["gateColumn"].IndexCount;
 	leftGateColumnRitem->StartIndexLocation = leftGateColumnRitem->Geo->DrawArgs["gateColumn"].StartIndexLocation;
 	leftGateColumnRitem->BaseVertexLocation = leftGateColumnRitem->Geo->DrawArgs["gateColumn"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(leftGateColumnRitem.get());
 	mAllRitems.push_back(std::move(leftGateColumnRitem));
 
 	// Right gate column
 	auto rightGateColumnRitem = std::make_unique<RenderItem>();
 	XMMATRIX rightColumnTransform = XMMatrixScaling(0.5f, 1.0f, 0.5f) * XMMatrixTranslation(3.0f, 4.0f, 34.0f);
 	XMStoreFloat4x4(&rightGateColumnRitem->World, rightColumnTransform);
+	XMStoreFloat4x4(&rightGateColumnRitem->TexTransform, XMMatrixScaling(0.5f, 1.0f, 0.5f));
 	rightGateColumnRitem->ObjCBIndex = objCBIndex++;
+	rightGateColumnRitem->Mat = mMaterials["stoneMat"].get();
 	rightGateColumnRitem->Geo = mGeometries["castleGeo"].get();
 	rightGateColumnRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	rightGateColumnRitem->IndexCount = rightGateColumnRitem->Geo->DrawArgs["gateColumn"].IndexCount;
 	rightGateColumnRitem->StartIndexLocation = rightGateColumnRitem->Geo->DrawArgs["gateColumn"].StartIndexLocation;
 	rightGateColumnRitem->BaseVertexLocation = rightGateColumnRitem->Geo->DrawArgs["gateColumn"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(rightGateColumnRitem.get());
 	mAllRitems.push_back(std::move(rightGateColumnRitem));
 
 	// ARROW SLITS in gatehouse 
@@ -1309,54 +1824,122 @@ void ShapesApp::BuildRenderItems()
 	auto gateArrowSlitLeftRitem = std::make_unique<RenderItem>();
 	XMMATRIX gateArrowLeftTransform = XMMatrixRotationY(0.0f) * XMMatrixTranslation(-5.0f, 7.0f, 31.5f);
 	XMStoreFloat4x4(&gateArrowSlitLeftRitem->World, gateArrowLeftTransform);
+	XMStoreFloat4x4(&gateArrowSlitLeftRitem->TexTransform, XMMatrixScaling(0.5f, 1.0f, 1.0f));
 	gateArrowSlitLeftRitem->ObjCBIndex = objCBIndex++;
+	gateArrowSlitLeftRitem->Mat = mMaterials["darkStoneMat"].get();
 	gateArrowSlitLeftRitem->Geo = mGeometries["castleGeo"].get();
 	gateArrowSlitLeftRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	gateArrowSlitLeftRitem->IndexCount = gateArrowSlitLeftRitem->Geo->DrawArgs["arrowSlit"].IndexCount;
 	gateArrowSlitLeftRitem->StartIndexLocation = gateArrowSlitLeftRitem->Geo->DrawArgs["arrowSlit"].StartIndexLocation;
 	gateArrowSlitLeftRitem->BaseVertexLocation = gateArrowSlitLeftRitem->Geo->DrawArgs["arrowSlit"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(gateArrowSlitLeftRitem.get());
 	mAllRitems.push_back(std::move(gateArrowSlitLeftRitem));
 
 	// Right arrow slit
 	auto gateArrowSlitRightRitem = std::make_unique<RenderItem>();
 	XMMATRIX gateArrowRightTransform = XMMatrixRotationY(0.0f) * XMMatrixTranslation(5.0f, 7.0f, 31.5f);
 	XMStoreFloat4x4(&gateArrowSlitRightRitem->World, gateArrowRightTransform);
+	XMStoreFloat4x4(&gateArrowSlitRightRitem->TexTransform, XMMatrixScaling(0.5f, 1.0f, 1.0f));
 	gateArrowSlitRightRitem->ObjCBIndex = objCBIndex++;
+	gateArrowSlitRightRitem->Mat = mMaterials["darkStoneMat"].get();
 	gateArrowSlitRightRitem->Geo = mGeometries["castleGeo"].get();
 	gateArrowSlitRightRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	gateArrowSlitRightRitem->IndexCount = gateArrowSlitRightRitem->Geo->DrawArgs["arrowSlit"].IndexCount;
 	gateArrowSlitRightRitem->StartIndexLocation = gateArrowSlitRightRitem->Geo->DrawArgs["arrowSlit"].StartIndexLocation;
 	gateArrowSlitRightRitem->BaseVertexLocation = gateArrowSlitRightRitem->Geo->DrawArgs["arrowSlit"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(gateArrowSlitRightRitem.get());
 	mAllRitems.push_back(std::move(gateArrowSlitRightRitem));
 
 
 	// All the render items are opaque.
-	for (auto& e : mAllRitems)
-		mOpaqueRitems.push_back(e.get());
+	/*for (auto& e : mAllRitems)
+		mOpaqueRitems.push_back(e.get());*/
 }
 
 void ShapesApp::DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vector<RenderItem*>& ritems)
 {
 	UINT objCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(ObjectConstants));
-	auto objectCB = mCurrFrameResource->ObjectCB->Resource();
-	// For each render item...
+	UINT matCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(MaterialConstants));
 
+	auto objectCB = mCurrFrameResource->ObjectCB->Resource();
+	auto matCB = mCurrFrameResource->MaterialCB->Resource();
+
+	// For each render item...
 	for (size_t i = 0; i < ritems.size(); ++i)
 	{
 		auto ri = ritems[i];
+
 		cmdList->IASetVertexBuffers(0, 1, &ri->Geo->VertexBufferView());
 		cmdList->IASetIndexBuffer(&ri->Geo->IndexBufferView());
 		cmdList->IASetPrimitiveTopology(ri->PrimitiveType);
 
-		// Offset to the CBV in the descriptor heap for this object and for this frame resource.
+		CD3DX12_GPU_DESCRIPTOR_HANDLE tex(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+		tex.Offset(ri->Mat->DiffuseSrvHeapIndex, mCbvSrvDescriptorSize);
 
-		UINT cbvIndex = mCurrFrameResourceIndex * (UINT)mOpaqueRitems.size() + ri->ObjCBIndex;
+		D3D12_GPU_VIRTUAL_ADDRESS objCBAddress = objectCB->GetGPUVirtualAddress() + ri->ObjCBIndex * objCBByteSize;
+		D3D12_GPU_VIRTUAL_ADDRESS matCBAddress = matCB->GetGPUVirtualAddress() + ri->Mat->MatCBIndex * matCBByteSize;
 
-		auto cbvHandle = CD3DX12_GPU_DESCRIPTOR_HANDLE(mCbvHeap->GetGPUDescriptorHandleForHeapStart());
+		cmdList->SetGraphicsRootDescriptorTable(0, tex);
+		cmdList->SetGraphicsRootConstantBufferView(1, objCBAddress);
+		cmdList->SetGraphicsRootConstantBufferView(3, matCBAddress);
 
-		cbvHandle.Offset(cbvIndex, mCbvSrvUavDescriptorSize);
-
-		cmdList->SetGraphicsRootDescriptorTable(0, cbvHandle);
 		cmdList->DrawIndexedInstanced(ri->IndexCount, 1, ri->StartIndexLocation, ri->BaseVertexLocation, 0);
 	}
+}
+
+std::array<const CD3DX12_STATIC_SAMPLER_DESC, 6> ShapesApp::GetStaticSamplers()
+{
+	// Applications usually only need a handful of samplers.  So just define them all up front
+	// and keep them available as part of the root signature.  
+
+	const CD3DX12_STATIC_SAMPLER_DESC pointWrap(
+		0, // shaderRegister
+		D3D12_FILTER_MIN_MAG_MIP_POINT, // filter
+		D3D12_TEXTURE_ADDRESS_MODE_WRAP,  // addressU
+		D3D12_TEXTURE_ADDRESS_MODE_WRAP,  // addressV
+		D3D12_TEXTURE_ADDRESS_MODE_WRAP); // addressW
+
+	const CD3DX12_STATIC_SAMPLER_DESC pointClamp(
+		1, // shaderRegister
+		D3D12_FILTER_MIN_MAG_MIP_POINT, // filter
+		D3D12_TEXTURE_ADDRESS_MODE_CLAMP,  // addressU
+		D3D12_TEXTURE_ADDRESS_MODE_CLAMP,  // addressV
+		D3D12_TEXTURE_ADDRESS_MODE_CLAMP); // addressW
+
+	const CD3DX12_STATIC_SAMPLER_DESC linearWrap(
+		2, // shaderRegister
+		D3D12_FILTER_MIN_MAG_MIP_LINEAR, // filter
+		D3D12_TEXTURE_ADDRESS_MODE_WRAP,  // addressU
+		D3D12_TEXTURE_ADDRESS_MODE_WRAP,  // addressV
+		D3D12_TEXTURE_ADDRESS_MODE_WRAP); // addressW
+
+	const CD3DX12_STATIC_SAMPLER_DESC linearClamp(
+		3, // shaderRegister
+		D3D12_FILTER_MIN_MAG_MIP_LINEAR, // filter
+		D3D12_TEXTURE_ADDRESS_MODE_CLAMP,  // addressU
+		D3D12_TEXTURE_ADDRESS_MODE_CLAMP,  // addressV
+		D3D12_TEXTURE_ADDRESS_MODE_CLAMP); // addressW
+
+	const CD3DX12_STATIC_SAMPLER_DESC anisotropicWrap(
+		4, // shaderRegister
+		D3D12_FILTER_ANISOTROPIC, // filter
+		D3D12_TEXTURE_ADDRESS_MODE_WRAP,  // addressU
+		D3D12_TEXTURE_ADDRESS_MODE_WRAP,  // addressV
+		D3D12_TEXTURE_ADDRESS_MODE_WRAP,  // addressW
+		0.0f,                             // mipLODBias
+		8);                               // maxAnisotropy
+
+	const CD3DX12_STATIC_SAMPLER_DESC anisotropicClamp(
+		5, // shaderRegister
+		D3D12_FILTER_ANISOTROPIC, // filter
+		D3D12_TEXTURE_ADDRESS_MODE_CLAMP,  // addressU
+		D3D12_TEXTURE_ADDRESS_MODE_CLAMP,  // addressV
+		D3D12_TEXTURE_ADDRESS_MODE_CLAMP,  // addressW
+		0.0f,                              // mipLODBias
+		8);                                // maxAnisotropy
+
+	return {
+		pointWrap, pointClamp,
+		linearWrap, linearClamp,
+		anisotropicWrap, anisotropicClamp };
 }
