@@ -263,18 +263,16 @@ void ShapesApp::Draw(const GameTimer& gt)
 	auto passCB = mCurrFrameResource->PassCB->Resource();
 	mCommandList->SetGraphicsRootConstantBufferView(2, passCB->GetGPUVirtualAddress());
 
-	// ========== DRAW IN CORRECT ORDER ==========
-	// 1. Draw OPAQUE objects first (castle, ground, walls, towers, etc.)
+	// Draw OPAQUE
 	DrawRenderItems(mCommandList.Get(), mRitemLayer[(int)RenderLayer::Opaque]);
 
-	// 2. Draw TREES (alpha tested - discards transparent pixels, renders over opaque)
+	// Draw TREES 
 	mCommandList->SetPipelineState(mPSOs["treeSprites"].Get());
 	DrawRenderItems(mCommandList.Get(), mRitemLayer[(int)RenderLayer::AlphaTestedTreeSprites]);
 
-	// 3. Draw TRANSPARENT objects last (water - blends with everything behind it)
+	// Draw TRANSPARENT 
 	mCommandList->SetPipelineState(mPSOs["transparent"].Get());
 	DrawRenderItems(mCommandList.Get(), mRitemLayer[(int)RenderLayer::Transparent]);
-	// ========== END DRAW ORDER ==========
 
 	// Indicate a state transition on the resource usage.
 	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(),
@@ -626,7 +624,6 @@ void ShapesApp::BuildShadersAndInputLayout()
 	mShaders["standardVS"] = d3dUtil::CompileShader(L"Shaders\\Default.hlsl", nullptr, "VS", "vs_5_0");
 	mShaders["opaquePS"] = d3dUtil::CompileShader(L"Shaders\\Default.hlsl", nullptr, "PS", "ps_5_0");
 
-	// ========== ADD TREE SPRITE SHADERS ==========
 	const D3D_SHADER_MACRO alphaTestDefines[] =
 	{
 		"ALPHA_TEST",
@@ -636,7 +633,6 @@ void ShapesApp::BuildShadersAndInputLayout()
 	mShaders["treeSpriteVS"] = d3dUtil::CompileShader(L"Shaders\\TreeSprite.hlsl", nullptr, "VS", "vs_5_0");
 	mShaders["treeSpriteGS"] = d3dUtil::CompileShader(L"Shaders\\TreeSprite.hlsl", nullptr, "GS", "gs_5_0");
 	mShaders["treeSpritePS"] = d3dUtil::CompileShader(L"Shaders\\TreeSprite.hlsl", alphaTestDefines, "PS", "ps_5_0");
-	// ========== END ADDED ==========
 
 	mInputLayout =
 	{
@@ -645,7 +641,6 @@ void ShapesApp::BuildShadersAndInputLayout()
 		{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
 	};
 
-	// ========== ADD TREE SPRITE INPUT LAYOUT ==========
 	mTreeSpriteInputLayout =
 	{
 		{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
@@ -999,14 +994,13 @@ void ShapesApp::BuildWaterGeometry()
 {
 	GeometryGenerator geoGen;
 
-	// Create a large water plane (200x200 units to surround the castle)
 	GeometryGenerator::MeshData waterPlane = geoGen.CreateGrid(200.0f, 200.0f, 100, 100);
 
 	std::vector<Vertex> vertices(waterPlane.Vertices.size());
 	for (size_t i = 0; i < waterPlane.Vertices.size(); ++i)
 	{
 		vertices[i].Pos = waterPlane.Vertices[i].Position;
-		vertices[i].Pos.y = -0.7f; // Place water slightly below ground
+		vertices[i].Pos.y = -0.7f;
 		vertices[i].Normal = waterPlane.Vertices[i].Normal;
 		vertices[i].TexC = waterPlane.Vertices[i].TexC;
 	}
@@ -1054,32 +1048,28 @@ void ShapesApp::BuildTreeSpritesGeometry()
 		XMFLOAT2 Size;
 	};
 
-	// Create 30 trees randomly placed around the castle
+	// Create 30 trees randomly
 	const int treeCount = 30;
 	std::vector<TreeVertex> vertices(treeCount);
 
 	for (int i = 0; i < treeCount; ++i)
 	{
-		// Random angle and distance from castle
 		float angle = MathHelper::RandF(0.0f, XM_2PI);
 		float radius = MathHelper::RandF(18.0f, 45.0f);
 
 		float x = cosf(angle) * radius;
 		float z = sinf(angle) * radius;
 
-		// Ground height (flat at -0.5f)
 		float groundY = -0.5f;
 		float treeY = groundY + 5.0f;
 
 		vertices[i].Pos = XMFLOAT3(x, treeY, z);
 
-		// Random tree size (width 5-10, height 8-14)
 		float width = MathHelper::RandF(5.0f, 10.0f);
 		float height = MathHelper::RandF(8.0f, 14.0f);
 		vertices[i].Size = XMFLOAT2(width, height);
 	}
 
-	// Create indices (each point is its own primitive)
 	std::vector<std::uint16_t> indices;
 	for (int i = 0; i < treeCount; ++i)
 		indices.push_back(i);
@@ -1151,12 +1141,10 @@ void ShapesApp::BuildPSOs()
 
 	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&opaquePsoDesc, IID_PPV_ARGS(&mPSOs["opaque"])));
 
-	// PSO for opaque wireframe objects
 	D3D12_GRAPHICS_PIPELINE_STATE_DESC opaqueWireframePsoDesc = opaquePsoDesc;
 	opaqueWireframePsoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
 	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&opaqueWireframePsoDesc, IID_PPV_ARGS(&mPSOs["opaque_wireframe"])));
 
-	// PSO for transparent objects (water)
 	D3D12_GRAPHICS_PIPELINE_STATE_DESC transparentPsoDesc = opaquePsoDesc;
 
 	D3D12_RENDER_TARGET_BLEND_DESC transparencyBlendDesc;
@@ -1174,10 +1162,8 @@ void ShapesApp::BuildPSOs()
 	transparentPsoDesc.BlendState.RenderTarget[0] = transparencyBlendDesc;
 	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&transparentPsoDesc, IID_PPV_ARGS(&mPSOs["transparent"])));
 
-	// ========== PSO for TREE SPRITES (with Geometry Shader) ==========
 	D3D12_GRAPHICS_PIPELINE_STATE_DESC treePsoDesc = opaquePsoDesc;
 
-	// Use tree sprite shaders
 	treePsoDesc.VS =
 	{
 		reinterpret_cast<BYTE*>(mShaders["treeSpriteVS"]->GetBufferPointer()),
@@ -1196,13 +1182,10 @@ void ShapesApp::BuildPSOs()
 		mShaders["treeSpritePS"]->GetBufferSize()
 	};
 
-	// Use tree sprite input layout
 	treePsoDesc.InputLayout = { mTreeSpriteInputLayout.data(), (UINT)mTreeSpriteInputLayout.size() };
 
-	// Set primitive topology type to POINT (since we're drawing points)
 	treePsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
 
-	// Create the PSO
 	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&treePsoDesc, IID_PPV_ARGS(&mPSOs["treeSprites"])));
 }
 
@@ -1277,7 +1260,7 @@ void ShapesApp::BuildMaterials()
 	auto treeMat = std::make_unique<Material>();
 	treeMat->Name = "treeMat";
 	treeMat->MatCBIndex = heapIndex++;
-	treeMat->DiffuseSrvHeapIndex = 5; // treeArrayTex
+	treeMat->DiffuseSrvHeapIndex = 5; 
 	treeMat->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
 	treeMat->FresnelR0 = XMFLOAT3(0.01f, 0.01f, 0.01f);
 	treeMat->Roughness = 0.2f;
@@ -1285,9 +1268,9 @@ void ShapesApp::BuildMaterials()
 	// Water material with transparency
 	auto waterMat = std::make_unique<Material>();
 	waterMat->Name = "waterMat";
-	waterMat->MatCBIndex = heapIndex++;  // Next available index
-	waterMat->DiffuseSrvHeapIndex = 6;  // Index for water texture (since you have 5 textures)
-	waterMat->DiffuseAlbedo = XMFLOAT4(0.2f, 0.4f, 0.8f, 0.6f); // Blue, semi-transparent
+	waterMat->MatCBIndex = heapIndex++; 
+	waterMat->DiffuseSrvHeapIndex = 6;  
+	waterMat->DiffuseAlbedo = XMFLOAT4(0.2f, 0.4f, 0.8f, 0.6f); 
 	waterMat->FresnelR0 = XMFLOAT3(0.1f, 0.1f, 0.1f);
 	waterMat->Roughness = 0.1f;
 
@@ -1314,7 +1297,7 @@ void ShapesApp::BuildRenderItems()
 
 	
 
-	// ========== WATER (Transparent Layer) ==========
+	// WATER
 	auto waterRitem = std::make_unique<RenderItem>();
 	XMStoreFloat4x4(&waterRitem->World, XMMatrixTranslation(0.0f, -0.7f, 0.0f));
 	XMStoreFloat4x4(&waterRitem->TexTransform, XMMatrixScaling(8.0f, 8.0f, 1.0f));
@@ -1345,7 +1328,7 @@ void ShapesApp::BuildRenderItems()
 	mRitemLayer[(int)RenderLayer::AlphaTestedTreeSprites].push_back(treeRitem.get());
 	mAllRitems.push_back(std::move(treeRitem));
 
-	// ========== GROUND (Opaque Layer) ==========
+	// GROUND 
 	auto groundRitem = std::make_unique<RenderItem>();
 	XMStoreFloat4x4(&groundRitem->World, XMMatrixTranslation(0.0f, -0.5f, 0.0f));
 	XMStoreFloat4x4(&groundRitem->TexTransform, XMMatrixScaling(8.0f, 8.0f, 1.0f));
@@ -1850,10 +1833,6 @@ void ShapesApp::BuildRenderItems()
 	mRitemLayer[(int)RenderLayer::Opaque].push_back(gateArrowSlitRightRitem.get());
 	mAllRitems.push_back(std::move(gateArrowSlitRightRitem));
 
-
-	// All the render items are opaque.
-	/*for (auto& e : mAllRitems)
-		mOpaqueRitems.push_back(e.get());*/
 }
 
 void ShapesApp::DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vector<RenderItem*>& ritems)
@@ -1864,7 +1843,6 @@ void ShapesApp::DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::v
 	auto objectCB = mCurrFrameResource->ObjectCB->Resource();
 	auto matCB = mCurrFrameResource->MaterialCB->Resource();
 
-	// For each render item...
 	for (size_t i = 0; i < ritems.size(); ++i)
 	{
 		auto ri = ritems[i];
@@ -1888,9 +1866,7 @@ void ShapesApp::DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::v
 }
 
 std::array<const CD3DX12_STATIC_SAMPLER_DESC, 6> ShapesApp::GetStaticSamplers()
-{
-	// Applications usually only need a handful of samplers.  So just define them all up front
-	// and keep them available as part of the root signature.  
+{  
 
 	const CD3DX12_STATIC_SAMPLER_DESC pointWrap(
 		0, // shaderRegister
