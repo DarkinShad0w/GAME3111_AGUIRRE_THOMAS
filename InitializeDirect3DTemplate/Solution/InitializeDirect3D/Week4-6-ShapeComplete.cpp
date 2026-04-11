@@ -56,10 +56,6 @@ private:
 	virtual void Update(const GameTimer& gt)override;
 	virtual void Draw(const GameTimer& gt)override;
 
-	virtual void OnMouseDown(WPARAM btnState, int x, int y)override;
-	virtual void OnMouseUp(WPARAM btnState, int x, int y)override;
-	virtual void OnMouseMove(WPARAM btnState, int x, int y)override;
-
 	void OnKeyboardInput(const GameTimer& gt);
 	void UpdateCamera(const GameTimer& gt);
 	void UpdateObjectCBs(const GameTimer& gt);
@@ -73,6 +69,7 @@ private:
 	void BuildShapeGeometry();
 	void BuildWaterGeometry();
 	void BuildTreeSpritesGeometry();
+	void BuildMazeGeometry();
 	void BuildPSOs();
 	void BuildFrameResources();
 	void BuildMaterials();
@@ -80,6 +77,8 @@ private:
 	void DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vector<RenderItem*>& ritems);
 
 	std::array<const CD3DX12_STATIC_SAMPLER_DESC, 6> GetStaticSamplers();
+
+	bool CheckCollision(const DirectX::XMFLOAT3& position, float radius);
 
 private:
 
@@ -112,13 +111,34 @@ private:
 
 	bool mIsWireframe = false;
 
-	XMFLOAT3 mEyePos = { 0.0f, 0.0f, 0.0f };
+	std::vector<DirectX::BoundingBox> mMazeWallBounds;  // Stores bounding boxes for all maze walls
+	float mCollisionRadius = 1.0f;
+
+	// WASD controls
+	XMFLOAT3 mCameraPos = { 0.0f, 0.0f, 100.0f };
+	XMFLOAT3 mCameraTarget = { 0.0f, 0.0f, 0.0f };
+	XMFLOAT3 mCameraUp = { 0.0f, 1.0f, 0.0f };
+
+	float mCameraYaw = 0.0f;      // Left/right rotation
+	float mCameraPitch = 0.0f;    // Up/down rotation
+
+	float mCameraSpeed = 15.0f;
+	float mCameraRotationSpeed = 1.5f;
+
 	XMFLOAT4X4 mView = MathHelper::Identity4x4();
 	XMFLOAT4X4 mProj = MathHelper::Identity4x4();
 
-	float mTheta = 1.5f * XM_PI;
-	float mPhi = 0.2f * XM_PI;
-	float mRadius = 15.0f;
+	bool mKeyW = false;
+	bool mKeyA = false;
+	bool mKeyS = false;
+	bool mKeyD = false;
+	bool mKeyQ = false;  // Move camera UP
+	bool mKeyE = false;  // Move camera DOWN
+
+	bool mKeyLeft = false;   // Rotate left (Arrow Left)
+	bool mKeyRight = false;  // Rotate right (Arrow Right)
+	bool mKeyUp = false;     // Rotate up (Arrow Up)
+	bool mKeyDown = false;   // Rotate down (Arrow Down)
 
 	POINT mLastMousePos;
 };
@@ -173,6 +193,7 @@ bool ShapesApp::Initialize()
 	BuildShapeGeometry();
 	BuildWaterGeometry();
 	BuildTreeSpritesGeometry();
+	BuildMazeGeometry();
 	BuildMaterials();
 	BuildRenderItems();
 	BuildFrameResources();
@@ -298,72 +319,142 @@ void ShapesApp::Draw(const GameTimer& gt)
 	mCommandQueue->Signal(mFence.Get(), mCurrentFence);
 }
 
-void ShapesApp::OnMouseDown(WPARAM btnState, int x, int y)
-{
-	mLastMousePos.x = x;
-	mLastMousePos.y = y;
-
-	SetCapture(mhMainWnd);
-}
-
-void ShapesApp::OnMouseUp(WPARAM btnState, int x, int y)
-{
-	ReleaseCapture();
-}
-
-void ShapesApp::OnMouseMove(WPARAM btnState, int x, int y)
-{
-	if ((btnState & MK_LBUTTON) != 0)
-	{
-		// Make each pixel correspond to a quarter of a degree.
-		float dx = XMConvertToRadians(0.25f * static_cast<float>(x - mLastMousePos.x));
-		float dy = XMConvertToRadians(0.25f * static_cast<float>(y - mLastMousePos.y));
-
-		// Update angles based on input to orbit camera around box.
-		mTheta += dx;
-		mPhi += dy;
-
-		// Restrict the angle mPhi.
-		mPhi = MathHelper::Clamp(mPhi, 0.1f, MathHelper::Pi - 0.1f);
-	}
-	else if ((btnState & MK_RBUTTON) != 0)
-	{
-		// Make each pixel correspond to 0.2 unit in the scene.
-		float dx = 0.05f * static_cast<float>(x - mLastMousePos.x);
-		float dy = 0.05f * static_cast<float>(y - mLastMousePos.y);
-
-		// Update the camera radius based on input.
-		mRadius += dx - dy;
-
-		// Restrict the radius.
-		mRadius = MathHelper::Clamp(mRadius, 5.0f, 150.0f);
-	}
-
-	mLastMousePos.x = x;
-	mLastMousePos.y = y;
-}
-
 void ShapesApp::OnKeyboardInput(const GameTimer& gt)
 {
 	if (GetAsyncKeyState('1') & 0x8000)
 		mIsWireframe = true;
 	else
 		mIsWireframe = false;
+
+	mKeyW = (GetAsyncKeyState('W') & 0x8000) != 0;
+	mKeyA = (GetAsyncKeyState('A') & 0x8000) != 0;
+	mKeyS = (GetAsyncKeyState('S') & 0x8000) != 0;
+	mKeyD = (GetAsyncKeyState('D') & 0x8000) != 0;
+	mKeyQ = (GetAsyncKeyState('Q') & 0x8000) != 0;  // Move camera UP
+	mKeyE = (GetAsyncKeyState('E') & 0x8000) != 0;  // Move camera DOWN
+
+	mKeyLeft = (GetAsyncKeyState(VK_LEFT) & 0x8000) != 0;   // Left arrow
+	mKeyRight = (GetAsyncKeyState(VK_RIGHT) & 0x8000) != 0;  // Right arrow
+	mKeyUp = (GetAsyncKeyState(VK_UP) & 0x8000) != 0;     // Up arrow
+	mKeyDown = (GetAsyncKeyState(VK_DOWN) & 0x8000) != 0;   // Down arrow
+}
+
+bool ShapesApp::CheckCollision(const XMFLOAT3& position, float radius)
+{
+	XMVECTOR pos = XMLoadFloat3(&position);
+
+	for (const auto& box : mMazeWallBounds)
+	{
+		XMVECTOR boxCenter = XMLoadFloat3(&box.Center);
+		XMVECTOR boxExtents = XMLoadFloat3(&box.Extents);
+
+		// Calculate the closest point on the box to the sphere center
+		XMVECTOR closestPoint = XMVectorClamp(pos,
+			XMVectorSubtract(boxCenter, boxExtents),
+			XMVectorAdd(boxCenter, boxExtents));
+
+		// Calculate distance from closest point to sphere center
+		XMVECTOR delta = XMVectorSubtract(closestPoint, pos);
+		float distance = XMVectorGetX(XMVector3Length(delta));
+
+		// If distance is less than radius, we have a collision
+		if (distance < radius)
+		{
+			return true;
+		}
+	}
+
+	return false;
 }
 
 void ShapesApp::UpdateCamera(const GameTimer& gt)
 {
-	// Convert Spherical to Cartesian coordinates.
-	mEyePos.x = mRadius * sinf(mPhi) * cosf(mTheta);
-	mEyePos.z = mRadius * sinf(mPhi) * sinf(mTheta);
-	mEyePos.y = mRadius * cosf(mPhi);
+	float moveDistance = mCameraSpeed * gt.DeltaTime();
+	float rotationDelta = mCameraRotationSpeed * gt.DeltaTime();
 
-	// Build the view matrix.
-	XMVECTOR pos = XMVectorSet(mEyePos.x, mEyePos.y, mEyePos.z, 1.0f);
-	XMVECTOR target = XMVectorZero();
-	XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+	// Update rotation angles
+	if (mKeyLeft)
+		mCameraYaw += rotationDelta;
+	if (mKeyRight)
+		mCameraYaw -= rotationDelta;
+	if (mKeyUp)
+		mCameraPitch += rotationDelta;
+	if (mKeyDown)
+		mCameraPitch -= rotationDelta;
 
-	XMMATRIX view = XMMatrixLookAtLH(pos, target, up);
+	mCameraPitch = MathHelper::Clamp(mCameraPitch, -1.4f, 1.4f);
+
+	// Calculate look direction
+	XMVECTOR lookDirection = XMVectorSet(
+		cosf(mCameraYaw) * cosf(mCameraPitch),
+		sinf(mCameraPitch),
+		sinf(mCameraYaw) * cosf(mCameraPitch),
+		0.0f);
+	lookDirection = XMVector3Normalize(lookDirection);
+
+	XMVECTOR forward = lookDirection;
+	XMVECTOR worldUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+	XMVECTOR right = XMVector3Cross(worldUp, forward);
+	right = XMVector3Normalize(right);
+	XMVECTOR up = XMVector3Cross(forward, right);
+
+	// Calculate desired movement
+	XMVECTOR cameraPos = XMLoadFloat3(&mCameraPos);
+	XMVECTOR desiredPos = cameraPos;
+
+	if (mKeyW)
+		desiredPos = XMVectorAdd(desiredPos, XMVectorMultiply(forward, XMVectorReplicate(moveDistance)));
+	if (mKeyS)
+		desiredPos = XMVectorSubtract(desiredPos, XMVectorMultiply(forward, XMVectorReplicate(moveDistance)));
+	if (mKeyD)
+		desiredPos = XMVectorAdd(desiredPos, XMVectorMultiply(right, XMVectorReplicate(moveDistance)));
+	if (mKeyA)
+		desiredPos = XMVectorSubtract(desiredPos, XMVectorMultiply(right, XMVectorReplicate(moveDistance)));
+	if (mKeyQ)
+		desiredPos = XMVectorAdd(desiredPos, XMVectorMultiply(worldUp, XMVectorReplicate(moveDistance)));
+	if (mKeyE)
+		desiredPos = XMVectorSubtract(desiredPos, XMVectorMultiply(worldUp, XMVectorReplicate(moveDistance)));
+
+	// COLLISION
+	XMVECTOR newPos = cameraPos;
+
+	XMVECTOR testPosX = XMVectorSetX(newPos, XMVectorGetX(desiredPos));
+	XMFLOAT3 testX;
+	XMStoreFloat3(&testX, testPosX);
+	if (!CheckCollision(testX, mCollisionRadius))
+	{
+		newPos = testPosX;
+	}
+
+	XMVECTOR testPosZ = XMVectorSetZ(newPos, XMVectorGetZ(desiredPos));
+	XMFLOAT3 testZ;
+	XMStoreFloat3(&testZ, testPosZ);
+	if (!CheckCollision(testZ, mCollisionRadius))
+	{
+		newPos = testPosZ;
+	}
+
+	XMVECTOR testPosY = XMVectorSetY(newPos, XMVectorGetY(desiredPos));
+	XMFLOAT3 testY;
+	XMStoreFloat3(&testY, testPosY);
+	if (!CheckCollision(testY, mCollisionRadius))
+	{
+		newPos = testPosY;
+	}
+
+	// Store new position
+	XMStoreFloat3(&mCameraPos, newPos);
+
+	// Update camera target
+	XMVECTOR target = XMVectorAdd(newPos, lookDirection);
+	XMStoreFloat3(&mCameraTarget, target);
+
+	// Build view matrix
+	XMVECTOR pos = XMLoadFloat3(&mCameraPos);
+	XMVECTOR targetVec = XMLoadFloat3(&mCameraTarget);
+	XMVECTOR upVec = up;
+
+	XMMATRIX view = XMMatrixLookAtLH(pos, targetVec, upVec);
 	XMStoreFloat4x4(&mView, view);
 }
 
@@ -427,7 +518,7 @@ void ShapesApp::UpdateMainPassCB(const GameTimer& gt)
 	XMStoreFloat4x4(&mMainPassCB.InvProj, XMMatrixTranspose(invProj));
 	XMStoreFloat4x4(&mMainPassCB.ViewProj, XMMatrixTranspose(viewProj));
 	XMStoreFloat4x4(&mMainPassCB.InvViewProj, XMMatrixTranspose(invViewProj));
-	mMainPassCB.EyePosW = mEyePos;
+	mMainPassCB.EyePosW = mCameraPos; //mEyePos;
 	mMainPassCB.RenderTargetSize = XMFLOAT2((float)mClientWidth, (float)mClientHeight);
 	mMainPassCB.InvRenderTargetSize = XMFLOAT2(1.0f / mClientWidth, 1.0f / mClientHeight);
 	mMainPassCB.NearZ = 1.0f;
@@ -1049,25 +1140,77 @@ void ShapesApp::BuildTreeSpritesGeometry()
 	};
 
 	// Create 30 trees randomly
-	const int treeCount = 30;
+	/*const int treeCount = 30;
+	std::vector<TreeVertex> vertices(treeCount);*/
+
+	const int treesPerSide = 12;  // 12 trees on each side of the maze
+	const int treeCount = treesPerSide * 4;  // 48 trees total
+
 	std::vector<TreeVertex> vertices(treeCount);
 
-	for (int i = 0; i < treeCount; ++i)
+	float groundY = -0.5f;
+	float treeY = groundY + 5.0f;
+
+	int treeIndex = 0;
+
+	// TREES LEFT SIDE 
+	float leftX = -38.0f;
+	for (int i = 0; i < treesPerSide; ++i)
 	{
-		float angle = MathHelper::RandF(0.0f, XM_2PI);
-		float radius = MathHelper::RandF(18.0f, 45.0f);
+		float t = (float)i / (float)(treesPerSide - 1);
+		float z = 38.0f + t * 54.0f;
 
-		float x = cosf(angle) * radius;
-		float z = sinf(angle) * radius;
+		vertices[treeIndex].Pos = XMFLOAT3(leftX, treeY, z);
 
-		float groundY = -0.5f;
-		float treeY = groundY + 5.0f;
+		float width = MathHelper::RandF(4.0f, 8.0f);
+		float height = MathHelper::RandF(7.0f, 12.0f);
+		vertices[treeIndex].Size = XMFLOAT2(width, height);
+		treeIndex++;
+	}
 
-		vertices[i].Pos = XMFLOAT3(x, treeY, z);
+	// TREES RIGHT SIDE
+	float rightX = 38.0f;
+	for (int i = 0; i < treesPerSide; ++i)
+	{
+		float t = (float)i / (float)(treesPerSide - 1);
+		float z = 38.0f + t * 54.0f;
 
-		float width = MathHelper::RandF(5.0f, 10.0f);
-		float height = MathHelper::RandF(8.0f, 14.0f);
-		vertices[i].Size = XMFLOAT2(width, height);
+		vertices[treeIndex].Pos = XMFLOAT3(rightX, treeY, z);
+
+		float width = MathHelper::RandF(4.0f, 8.0f);
+		float height = MathHelper::RandF(7.0f, 12.0f);
+		vertices[treeIndex].Size = XMFLOAT2(width, height);
+		treeIndex++;
+	}
+
+	// TREES BACK SIDE 
+	float backZ = 36.0f;
+	for (int i = 0; i < treesPerSide; ++i)
+	{
+		float t = (float)i / (float)(treesPerSide - 1);
+		float x = -35.0f + t * 70.0f;
+
+		vertices[treeIndex].Pos = XMFLOAT3(x, treeY, backZ);
+
+		float width = MathHelper::RandF(4.0f, 8.0f);
+		float height = MathHelper::RandF(7.0f, 12.0f);
+		vertices[treeIndex].Size = XMFLOAT2(width, height);
+		treeIndex++;
+	}
+
+	// TREES FRONT SIDE
+	float frontZ = 94.0f;
+	for (int i = 0; i < treesPerSide; ++i)
+	{
+		float t = (float)i / (float)(treesPerSide - 1);
+		float x = -35.0f + t * 70.0f;
+
+		vertices[treeIndex].Pos = XMFLOAT3(x, treeY, frontZ);
+
+		float width = MathHelper::RandF(4.0f, 8.0f);
+		float height = MathHelper::RandF(7.0f, 12.0f);
+		vertices[treeIndex].Size = XMFLOAT2(width, height);
+		treeIndex++;
 	}
 
 	std::vector<std::uint16_t> indices;
@@ -1105,6 +1248,147 @@ void ShapesApp::BuildTreeSpritesGeometry()
 	geo->DrawArgs["points"] = submesh;
 
 	mGeometries["treeGeo"] = std::move(geo);
+}
+
+void ShapesApp::BuildMazeGeometry()
+{
+	GeometryGenerator geoGen;
+
+	mMazeWallBounds.clear();
+
+	std::vector<Vertex> allVertices;
+	std::vector<std::uint16_t> allIndices;
+	UINT vertexOffset = 0;
+
+	auto addWallSegment = [&](float startX, float startZ, float endX, float endZ, float height)
+		{
+			float groundY = -0.5f;
+			float length = sqrtf((endX - startX) * (endX - startX) + (endZ - startZ) * (endZ - startZ));
+			float width = 1.0f;
+
+			float centerX = (startX + endX) / 2.0f;
+			float centerZ = (startZ + endZ) / 2.0f;
+			float angle = atan2f(endZ - startZ, endX - startX);
+
+			BoundingBox box;
+			box.Center = XMFLOAT3(centerX, groundY + height / 2.0f, centerZ + 110.0f);
+			box.Extents = XMFLOAT3(length / 2.5f + 0.1f, height / 2.0f, width / 2.5f + 0.1f);
+			mMazeWallBounds.push_back(box);
+
+			GeometryGenerator::MeshData wall = geoGen.CreateBox(length, height, width, 3);
+
+			for (const auto& v : wall.Vertices)
+			{
+				Vertex vert;
+				float rotatedX = v.Position.x * cosf(angle) - v.Position.z * sinf(angle);
+				float rotatedZ = v.Position.x * sinf(angle) + v.Position.z * cosf(angle);
+				vert.Pos.x = centerX + rotatedX;
+				vert.Pos.z = centerZ + rotatedZ;
+				vert.Pos.y = groundY + height / 2.0f + v.Position.y;
+				vert.Normal = v.Normal;
+				vert.TexC = v.TexC;
+				allVertices.push_back(vert);
+			}
+
+			for (const auto& idx : wall.Indices32)
+			{
+				allIndices.push_back(vertexOffset + idx);
+			}
+
+			vertexOffset += (UINT)wall.Vertices.size();
+		};
+
+	// OUTER WALLS
+	addWallSegment(-35.0f, -70.0f, -5.0f, -70.0f, 4.0f);
+	addWallSegment(5.0f, -70.0f, 35.0f, -70.0f, 4.0f);
+	addWallSegment(-35.0f, -20.0f, -5.0f, -20.0f, 4.0f);
+	addWallSegment(5.0f, -20.0f, 35.0f, -20.0f, 4.0f);
+	addWallSegment(-35.0f, -70.0f, -35.0f, -20.0f, 4.0f);
+	addWallSegment(35.0f, -70.0f, 35.0f, -20.0f, 4.0f);
+
+	// Horizontals
+	addWallSegment(-35.0f, -62.0f, -20.0f, -62.0f, 4.0f);
+	addWallSegment(20.0f, -62.0f, 35.0f, -62.0f, 4.0f);
+
+	addWallSegment(-35.0f, -54.0f, -10.0f, -54.0f, 4.0f);
+	addWallSegment(-7.0f, -54.0f, 35.0f, -54.0f, 4.0f);
+
+	addWallSegment(-35.0f, -46.0f, -25.0f, -46.0f, 4.0f);
+	addWallSegment(5.0f, -46.0f, 35.0f, -46.0f, 4.0f);
+
+	addWallSegment(-35.0f, -38.0f, -20.0f, -38.0f, 4.0f);
+	addWallSegment(-15.0f, -38.0f, 10.0f, -38.0f, 4.0f);
+	addWallSegment(20.0f, -38.0f, 35.0f, -38.0f, 4.0f);
+
+	addWallSegment(-35.0f, -30.0f, -15.0f, -30.0f, 4.0f);
+	addWallSegment(15.0f, -30.0f, 35.0f, -30.0f, 4.0f);
+
+	// Verticals
+
+	addWallSegment(-30.0f, -70.0f, -30.0f, -62.0f, 4.0f);
+	addWallSegment(-30.0f, -54.0f, -30.0f, -46.0f, 4.0f);
+	addWallSegment(-30.0f, -38.0f, -30.0f, -30.0f, 4.0f);
+
+	addWallSegment(-22.0f, -62.0f, -22.0f, -54.0f, 4.0f);
+	addWallSegment(-22.0f, -46.0f, -22.0f, -38.0f, 4.0f);
+	addWallSegment(-22.0f, -30.0f, -22.0f, -20.0f, 4.0f);
+
+	addWallSegment(-14.0f, -70.0f, -14.0f, -62.0f, 4.0f);
+	addWallSegment(-14.0f, -54.0f, -14.0f, -46.0f, 4.0f);
+	addWallSegment(-14.0f, -38.0f, -14.0f, -30.0f, 4.0f);
+
+	addWallSegment(-6.0f, -62.0f, -6.0f, -54.0f, 4.0f);
+	addWallSegment(-6.0f, -46.0f, -6.0f, -38.0f, 4.0f);
+
+	addWallSegment(6.0f, -70.0f, 6.0f, -62.0f, 4.0f);
+	addWallSegment(6.0f, -54.0f, 6.0f, -46.0f, 4.0f);
+	addWallSegment(6.0f, -38.0f, 6.0f, -30.0f, 4.0f);
+
+	addWallSegment(14.0f, -62.0f, 14.0f, -54.0f, 4.0f);
+	addWallSegment(14.0f, -46.0f, 14.0f, -38.0f, 4.0f);
+	addWallSegment(14.0f, -30.0f, 14.0f, -20.0f, 4.0f);
+
+	addWallSegment(22.0f, -70.0f, 22.0f, -62.0f, 4.0f);
+	addWallSegment(22.0f, -54.0f, 22.0f, -46.0f, 4.0f);
+	addWallSegment(22.0f, -38.0f, 22.0f, -30.0f, 4.0f);
+
+	addWallSegment(30.0f, -62.0f, 30.0f, -54.0f, 4.0f);
+	addWallSegment(30.0f, -46.0f, 30.0f, -38.0f, 4.0f);
+	addWallSegment(30.0f, -30.0f, 30.0f, -20.0f, 4.0f);
+
+
+	// Create the mesh geometry
+	const UINT vbByteSize = (UINT)allVertices.size() * sizeof(Vertex);
+	const UINT ibByteSize = (UINT)allIndices.size() * sizeof(std::uint16_t);
+
+	auto geo = std::make_unique<MeshGeometry>();
+	geo->Name = "mazeGeo";
+
+	ThrowIfFailed(D3DCreateBlob(vbByteSize, &geo->VertexBufferCPU));
+	CopyMemory(geo->VertexBufferCPU->GetBufferPointer(), allVertices.data(), vbByteSize);
+
+	ThrowIfFailed(D3DCreateBlob(ibByteSize, &geo->IndexBufferCPU));
+	CopyMemory(geo->IndexBufferCPU->GetBufferPointer(), allIndices.data(), ibByteSize);
+
+	geo->VertexBufferGPU = d3dUtil::CreateDefaultBuffer(md3dDevice.Get(),
+		mCommandList.Get(), allVertices.data(), vbByteSize, geo->VertexBufferUploader);
+
+	geo->IndexBufferGPU = d3dUtil::CreateDefaultBuffer(md3dDevice.Get(),
+		mCommandList.Get(), allIndices.data(), ibByteSize, geo->IndexBufferUploader);
+
+	geo->VertexByteStride = sizeof(Vertex);
+	geo->VertexBufferByteSize = vbByteSize;
+	geo->IndexFormat = DXGI_FORMAT_R16_UINT;
+	geo->IndexBufferByteSize = ibByteSize;
+
+	SubmeshGeometry submesh;
+	submesh.IndexCount = (UINT)allIndices.size();
+	submesh.StartIndexLocation = 0;
+	submesh.BaseVertexLocation = 0;
+
+	geo->DrawArgs["walls"] = submesh;
+
+	mGeometries["mazeGeo"] = std::move(geo);
 }
 
 void ShapesApp::BuildPSOs()
@@ -1327,6 +1611,20 @@ void ShapesApp::BuildRenderItems()
 
 	mRitemLayer[(int)RenderLayer::AlphaTestedTreeSprites].push_back(treeRitem.get());
 	mAllRitems.push_back(std::move(treeRitem));
+
+	// MAZE
+	auto mazeRitem = std::make_unique<RenderItem>();
+	XMStoreFloat4x4(&mazeRitem->World, XMMatrixTranslation(0.0f, 0.0f, 110.0f));
+	XMStoreFloat4x4(&mazeRitem->TexTransform, XMMatrixScaling(1.0f, 1.0f, 1.0f));
+	mazeRitem->ObjCBIndex = objCBIndex++;
+	mazeRitem->Mat = mMaterials["stoneMat"].get();
+	mazeRitem->Geo = mGeometries["mazeGeo"].get();
+	mazeRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+	mazeRitem->IndexCount = mazeRitem->Geo->DrawArgs["walls"].IndexCount;
+	mazeRitem->StartIndexLocation = mazeRitem->Geo->DrawArgs["walls"].StartIndexLocation;
+	mazeRitem->BaseVertexLocation = mazeRitem->Geo->DrawArgs["walls"].BaseVertexLocation;
+	mRitemLayer[(int)RenderLayer::Opaque].push_back(mazeRitem.get());
+	mAllRitems.push_back(std::move(mazeRitem));
 
 	// GROUND 
 	auto groundRitem = std::make_unique<RenderItem>();
